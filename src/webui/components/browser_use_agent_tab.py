@@ -419,6 +419,8 @@ async def run_agent_task(
         llm_api_key,
         ollama_num_ctx if llm_provider_name == "ollama" else None,
     )
+    if not main_llm:
+        raise ValueError(f"Failed to initialize LLM '{llm_model_name}' for provider '{llm_provider_name}'. Please check your API key and model settings.")
 
     # Pass the webui_manager instance to the callback when wrapping it
     async def ask_callback_wrapper(

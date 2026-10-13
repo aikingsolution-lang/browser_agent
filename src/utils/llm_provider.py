@@ -239,9 +239,9 @@ def get_llm_model(provider: str, **kwargs):
             )
     elif provider == "google":
         return ChatGoogleGenerativeAI(
-            model=kwargs.get("model_name", "gemini-2.0-flash-exp"),
+            model=kwargs.get("model_name", "gemini-3.5-flash"),
             temperature=kwargs.get("temperature", 0.0),
-            api_key=api_key,
+            google_api_key=api_key,
         )
     elif provider == "ollama":
         if not kwargs.get("base_url", ""):
