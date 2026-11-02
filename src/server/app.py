@@ -44,6 +44,23 @@ async def test_navigation(request: NavigateRequest):
     return {"status": "command_sent", "url": str(request.url)}
 
 
+@app.post("/test/state")
+async def test_page_state():
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "GET_STATE",
+        "params": {}
+    })
+
+    return {"status": "state_request_sent"}
+
 @app.websocket("/ws/extension")
 async def extension_connection(websocket: WebSocket):
     global extension_socket
