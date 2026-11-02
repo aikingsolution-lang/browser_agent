@@ -11,7 +11,7 @@ function connectToBackend() {
     if (
         socket &&
         (socket.readyState === WebSocket.OPEN ||
-         socket.readyState === WebSocket.CONNECTING)
+            socket.readyState === WebSocket.CONNECTING)
     ) {
         return;
     }
@@ -75,12 +75,152 @@ function connectToBackend() {
 }
 
 
+async function getPageState() {
+
+    // Find the active Chrome tab
+    const [activeTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+
+    if (!activeTab || activeTab.id === undefined) {
+        throw new Error("No active browser tab found");
+    }
+
+    // Chrome internal pages cannot be inspected this way
+    if (!/^https?:\/\//i.test(activeTab.url || "")) {
+        throw new Error("This page cannot be inspected");
+    }
+
+    // Execute JavaScript inside the webpage
+    const results = await chrome.scripting.executeScript({
+        target: {
+            tabId: activeTab.id
+        },
+
+        func: () => {
+
+            // Check whether an element is visible
+            function isVisible(element) {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden"
+                );
+            }
+
+            // Generate an XPath for an element
+            function getXPath(element) {
+                const path = [];
+
+                while (
+                    element &&
+                    element.nodeType === Node.ELEMENT_NODE
+                ) {
+                    const tag = element.localName;
+                    let index = 1;
+
+                    let sibling = element.previousElementSibling;
+
+                    while (sibling) {
+                        if (sibling.localName === tag) {
+                            index++;
+                        }
+                        sibling = sibling.previousElementSibling;
+                    }
+
+                    path.unshift(`${tag}[${index}]`);
+
+                    if (tag === "html") break;
+
+                    element = element.parentElement;
+                }
+
+                return "/" + path.join("/");
+            }
+
+            // Find interactive webpage elements
+            const selectors = [
+                "a[href]",
+                "button",
+                "input",
+                "textarea",
+                "select",
+                '[role="button"]',
+                '[role="link"]',
+                '[contenteditable="true"]',
+                '[tabindex]:not([tabindex="-1"])'
+            ].join(",");
+
+            const elements = Array.from(
+                document.querySelectorAll(selectors)
+            )
+                .filter(isVisible)
+                .slice(0, 80);
+
+            const interactiveElements = elements.map(
+                (element, index) => {
+
+                    const text = (
+                        element.innerText ||
+                        element.textContent ||
+                        element.getAttribute("aria-label") ||
+                        element.getAttribute("placeholder") ||
+                        ""
+                    ).trim().replace(/\s+/g, " ");
+
+                    return {
+                        index,
+                        tag: element.localName,
+                        text: text.slice(0, 200),
+                        xpath: getXPath(element),
+                        placeholder: element.getAttribute("placeholder"),
+                        aria_label: element.getAttribute("aria-label"),
+                        type: element.getAttribute("type"),
+                        href: element.href || null,
+                        disabled: Boolean(element.disabled)
+                    };
+                }
+            );
+
+            return {
+                url: location.href,
+                title: document.title,
+
+                // Limit webpage text to avoid huge responses
+                page_text: (
+                    document.body?.innerText || ""
+                ).slice(0, 4000),
+
+                interactive_elements: interactiveElements
+            };
+        }
+    });
+
+    return results[0].result;
+}
+
 // Execute browser action
 async function executeAction(message, currentSocket) {
     try {
         const { action, params = {} } = message;
 
-        if (action === "NAVIGATE") {
+        if (action === "GET_STATE") {
+
+            const state = await getPageState();
+
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "GET_STATE",
+                success: true,
+                result: state
+            });
+
+        } else if (action === "NAVIGATE") {
             const url = new URL(params.url);
 
             // Only allow regular web URLs
