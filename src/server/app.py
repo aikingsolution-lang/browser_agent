@@ -40,6 +40,25 @@ async def health_check():
     }
 
 
+
+@app.post("/test/tabs")
+async def test_get_tabs():
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "GET_TABS",
+        "params": {}
+    })
+
+    return {"status": "tabs_request_sent"}
+
+
 @app.post("/test/scroll")
 async def test_scroll(request: ScrollRequest):
 

@@ -648,46 +648,73 @@ async function executeAction(message, currentSocket) {
             });
         }
 
-        
-else if (action === "SCROLL") {
 
-    const [activeTab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true
-    });
+        else if (action === "SCROLL") {
 
-    if (!activeTab || activeTab.id === undefined) {
-        throw new Error("No active tab found");
-    }
+            const [activeTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true
+            });
 
-    const direction = params.direction || "DOWN";
-    const amount = params.amount || 600;
+            if (!activeTab || activeTab.id === undefined) {
+                throw new Error("No active tab found");
+            }
 
-    if (!["UP", "DOWN"].includes(direction)) {
-        throw new Error("Invalid scroll direction");
-    }
+            const direction = params.direction || "DOWN";
+            const amount = params.amount || 600;
 
-    if (
-        !Number.isInteger(amount) ||
-        amount < 1 ||
-        amount > 3000
-    ) {
-        throw new Error("Invalid scroll amount");
-    }
+            if (!["UP", "DOWN"].includes(direction)) {
+                throw new Error("Invalid scroll direction");
+            }
 
-    const result = await scrollPage(
-        activeTab.id,
-        direction,
-        amount
-    );
+            if (
+                !Number.isInteger(amount) ||
+                amount < 1 ||
+                amount > 3000
+            ) {
+                throw new Error("Invalid scroll amount");
+            }
 
-    sendResult(currentSocket, {
-        type: "ACTION_RESULT",
-        action: "SCROLL",
-        success: true,
-        result
-    });
-}
+            const result = await scrollPage(
+                activeTab.id,
+                direction,
+                amount
+            );
+
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "SCROLL",
+                success: true,
+                result
+            });
+        }
+
+
+
+        else if (action === "GET_TABS") {
+
+            const tabs = await chrome.tabs.query({});
+
+            const tabList = tabs
+                .filter(tab =>
+                    tab.id !== undefined &&
+                    /^https?:\/\//i.test(tab.url || "")
+                )
+                .map(tab => ({
+                    tabId: tab.id,
+                    title: tab.title || "",
+                    url: tab.url || "",
+                    active: tab.active,
+                    windowId: tab.windowId
+                }));
+
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "GET_TABS",
+                success: true,
+                result: tabList
+            });
+        }
 
 
 
