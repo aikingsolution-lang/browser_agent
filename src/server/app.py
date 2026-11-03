@@ -19,6 +19,16 @@ class TypeRequest(BaseModel):
 class ClickRequest(BaseModel):
     xpath: str   
 
+class PressKeyRequest(BaseModel):
+    xpath: str
+    key: str = "ENTER"
+
+class ScrollRequest(BaseModel):
+    direction: str = "DOWN"
+    amount: int = 600
+
+
+
 @app.get("/health")
 async def health_check():
     return {
@@ -28,6 +38,49 @@ async def health_check():
             and extension_socket.client_state == WebSocketState.CONNECTED
         )
     }
+
+
+@app.post("/test/scroll")
+async def test_scroll(request: ScrollRequest):
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "SCROLL",
+        "params": {
+            "direction": request.direction,
+            "amount": request.amount
+        }
+    })
+
+    return {"status": "scroll_command_sent"}
+
+
+@app.post("/test/press-key")
+async def test_press_key(request: PressKeyRequest):
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "PRESS_KEY",
+        "params": {
+            "xpath": request.xpath,
+            "key": request.key
+        }
+    })
+
+    return {"status": "key_command_sent"}
+
 
 
 @app.post("/test/navigate")

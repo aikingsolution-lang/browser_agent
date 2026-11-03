@@ -421,6 +421,118 @@ async function clickElement(tabId, xpath) {
 }
 
 
+async function pressKeyOnElement(tabId, xpath, key) {
+
+    if (key.toUpperCase() !== "ENTER") {
+        throw new Error("Currently only ENTER is supported");
+    }
+
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [xpath],
+
+        func: (xpath) => {
+
+            // Find the element
+            const element = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+
+            if (!(element instanceof HTMLInputElement)) {
+                return {
+                    success: false,
+                    error: "Target must be an input element"
+                };
+            }
+
+            if (
+                element.disabled ||
+                element.readOnly ||
+                ["password", "file", "hidden"].includes(element.type)
+            ) {
+                return {
+                    success: false,
+                    error: "Input cannot be submitted"
+                };
+            }
+
+            const form = element.form;
+
+            if (!form) {
+                return {
+                    success: false,
+                    error: "Input has no associated form"
+                };
+            }
+
+            // Focus input
+            element.focus();
+
+            // Submit using browser's native form behavior
+            form.requestSubmit();
+
+            return {
+                success: true,
+                key: "ENTER",
+                method: "requestSubmit"
+            };
+        }
+    });
+
+    const result = results?.[0]?.result;
+
+    if (!result?.success) {
+        throw new Error(result?.error || "Enter action failed");
+    }
+
+    return result;
+}
+
+
+
+async function scrollPage(tabId, direction, amount = 600) {
+
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [direction, amount],
+
+        func: (direction, amount) => {
+
+            const delta = direction === "DOWN"
+                ? amount
+                : -amount;
+
+            window.scrollBy({
+                top: delta,
+                left: 0,
+                behavior: "auto"
+            });
+
+            return {
+                success: true,
+                direction,
+                scrollY: window.scrollY,
+                pageHeight: document.documentElement.scrollHeight,
+                viewportHeight: window.innerHeight
+            };
+        }
+    });
+
+    const result = results?.[0]?.result;
+
+    if (!result?.success) {
+        throw new Error("Scrolling failed");
+    }
+
+    return result;
+}
+
+
+
 // Execute browser action
 
 async function executeAction(message, currentSocket) {
@@ -509,6 +621,75 @@ async function executeAction(message, currentSocket) {
                 tabId: newTab.id
             });
         }
+
+
+        else if (action === "PRESS_KEY") {
+
+            const [activeTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true
+            });
+
+            if (!activeTab || activeTab.id === undefined) {
+                throw new Error("No active tab found");
+            }
+
+            const result = await pressKeyOnElement(
+                activeTab.id,
+                params.xpath,
+                params.key
+            );
+
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "PRESS_KEY",
+                success: true,
+                result: result
+            });
+        }
+
+        
+else if (action === "SCROLL") {
+
+    const [activeTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+
+    if (!activeTab || activeTab.id === undefined) {
+        throw new Error("No active tab found");
+    }
+
+    const direction = params.direction || "DOWN";
+    const amount = params.amount || 600;
+
+    if (!["UP", "DOWN"].includes(direction)) {
+        throw new Error("Invalid scroll direction");
+    }
+
+    if (
+        !Number.isInteger(amount) ||
+        amount < 1 ||
+        amount > 3000
+    ) {
+        throw new Error("Invalid scroll amount");
+    }
+
+    const result = await scrollPage(
+        activeTab.id,
+        direction,
+        amount
+    );
+
+    sendResult(currentSocket, {
+        type: "ACTION_RESULT",
+        action: "SCROLL",
+        success: true,
+        result
+    });
+}
+
+
 
         else {
             throw new Error(`Unsupported action: ${action}`);
