@@ -27,6 +27,7 @@ send_lock = asyncio.Lock()
 SUPPORTED_ACTIONS = {
     "NAVIGATE",
     "GET_STATE",
+    "GET_DOM_STATE",
     "TYPE",
     "CLICK",
     "PRESS_KEY",

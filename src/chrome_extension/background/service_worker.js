@@ -1,3 +1,9 @@
+// Load Browser Use buildDomTree.js for Pattern A execution in service worker
+try {
+    importScripts("../injected/buildDomTree.js");
+} catch (importErr) {
+    console.warn("importScripts for buildDomTree failed (will use Pattern B):", importErr);
+}
 
 const BACKEND_URL = "ws://127.0.0.1:8765/ws/extension";
 
@@ -204,6 +210,105 @@ async function getPageState() {
     return results[0].result;
 }
 
+
+async function getDOMState() {
+    // Find the active Chrome tab
+    const [activeTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+
+    if (!activeTab || activeTab.id === undefined) {
+        throw new Error("No active browser tab found");
+    }
+
+    if (!/^https?:\/\//i.test(activeTab.url || "")) {
+        throw new Error("This page cannot be inspected: " + (activeTab.url || "unsupported protocol"));
+    }
+
+    const tabId = activeTab.id;
+
+    const defaultArgs = {
+        doHighlightElements: false,
+        focusHighlightIndex: -1,
+        viewportExpansion: 0,
+        debugMode: false
+    };
+
+    let evalPage = null;
+
+    // Pattern A: pass self-contained func to chrome.scripting.executeScript
+    try {
+        if (typeof buildDomTree === "function") {
+            const results = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: buildDomTree,
+                args: [defaultArgs]
+            });
+            if (results && results[0] && results[0].result) {
+                evalPage = results[0].result;
+            }
+        }
+    } catch (patternAError) {
+        console.warn("Pattern A execution failed, falling back to Pattern B:", patternAError);
+    }
+
+    // Pattern B Fallback: Packaged script execution
+    if (!evalPage) {
+        await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ["injected/buildDomTree.js"]
+        });
+
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: (args) => {
+                const fn = window.buildDomTree || globalThis.buildDomTree;
+                if (typeof fn === "function") {
+                    return fn(args);
+                }
+                throw new Error("window.buildDomTree is not defined on target page");
+            },
+            args: [defaultArgs]
+        });
+
+        if (results && results[0] && results[0].result) {
+            evalPage = results[0].result;
+        }
+    }
+
+    if (!evalPage || !evalPage.map || evalPage.rootId === undefined) {
+        throw new Error("Failed to extract DOM tree: invalid eval_page data returned");
+    }
+
+    // Measure scroll positions
+    const scrollResults = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+            const scrollY = window.scrollY || window.pageYOffset || 0;
+            const viewportHeight = window.innerHeight || 0;
+            const docElement = document.documentElement;
+            const totalHeight = docElement ? docElement.scrollHeight : (document.body ? document.body.scrollHeight : 0);
+            return {
+                pixels_above: Math.max(0, Math.round(scrollY)),
+                pixels_below: Math.max(0, Math.round(totalHeight - (scrollY + viewportHeight)))
+            };
+        }
+    });
+
+    const scroll = scrollResults?.[0]?.result || { pixels_above: 0, pixels_below: 0 };
+
+    return {
+        url: activeTab.url || "",
+        title: activeTab.title || "",
+        tab_id: tabId,
+        eval_page: evalPage,
+        pixels_above: scroll.pixels_above,
+        pixels_below: scroll.pixels_below
+    };
+}
+
+
 async function typeIntoElement(tabId, xpath, text) {
 
     const results = await chrome.scripting.executeScript({
@@ -213,14 +318,24 @@ async function typeIntoElement(tabId, xpath, text) {
 
         func: (xpath, text) => {
 
-            // Find element using XPath
-            const element = document.evaluate(
+            // Find element using XPath (supports relative and absolute paths)
+            let element = document.evaluate(
                 xpath,
                 document,
                 null,
                 XPathResult.FIRST_ORDERED_NODE_TYPE,
                 null
             ).singleNodeValue;
+
+            if (!element && !xpath.startsWith("/")) {
+                element = document.evaluate(
+                    "/" + xpath,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+            }
 
             if (!(element instanceof HTMLElement)) {
                 return {
@@ -608,6 +723,16 @@ async function executeAction(message, currentSocket) {
                 action: "GET_STATE",
                 success: true,
                 result: state
+            });
+        }
+        else if (action === "GET_DOM_STATE") {
+            const domState = await getDOMState();
+
+            sendActionResult({
+                type: "ACTION_RESULT",
+                action: "GET_DOM_STATE",
+                success: true,
+                result: domState
             });
         }
         else if (action === "TYPE") {

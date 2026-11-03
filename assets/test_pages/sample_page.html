@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Browser Use DOM Test Page</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .interactive-section { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; max-width: 400px; }
+    button { padding: 10px; cursor: pointer; }
+    #result-msg { margin-top: 15px; font-weight: bold; color: green; }
+  </style>
+</head>
+<body>
+  <h1>Browser Use DOM Extraction Test</h1>
+  <p>This deterministic test page validates DOM extraction, element indexing, and click-by-index execution.</p>
+
+  <div class="interactive-section">
+    <label for="search-box">Search Input:</label>
+    <input id="search-box" type="text" placeholder="Enter search term..." />
+
+    <button id="test-btn" onclick="document.getElementById('result-msg').innerText = 'Button Clicked Successfully!'">
+      Submit Action
+    </button>
+
+    <a id="test-link" href="https://example.com" target="_blank">
+      External Documentation
+    </a>
+  </div>
+
+  <div id="result-msg">Initial State</div>
+</body>
+</html>
