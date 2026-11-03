@@ -83,6 +83,7 @@ class TestExtensionBrowserContextUnit(unittest.IsolatedAsyncioTestCase):
     async def test_get_state_reconstruction_and_caching(self):
         """4. & 5. Verify get_state() reconstructs BrowserState and caches state/selector_map."""
         context = ExtensionBrowserContext()
+        context.adopt_tab(101)
 
         mock_response = {
             "type": "ACTION_RESULT",
@@ -97,7 +98,7 @@ class TestExtensionBrowserContextUnit(unittest.IsolatedAsyncioTestCase):
             state = await context.get_state()
 
             # Verify execute_action called with GET_DOM_STATE
-            mock_exec.assert_awaited_once_with("GET_DOM_STATE")
+            mock_exec.assert_awaited_once_with("GET_DOM_STATE", {"tabId": 101})
 
             # Verify genuine BrowserState
             self.assertIsInstance(state, BrowserState)

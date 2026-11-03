@@ -11,8 +11,49 @@ try {
 } catch (_) {}
 const AUTH_TOKEN = (typeof self !== "undefined" && self.AUTH_TOKEN) || "";
 
-// Track agent-owned tabs (DEF-04)
-const agentTabIds = new Set();
+// In-memory fallback and persistent session storage for agent-owned tabs (DEF-04)
+let agentTabIdsInMemory = new Set();
+
+async function getStoredAgentTabIds() {
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) {
+        try {
+            const data = await chrome.storage.session.get("agentTabIds");
+            if (Array.isArray(data.agentTabIds)) {
+                return new Set(data.agentTabIds);
+            }
+        } catch (_) {}
+    }
+    return agentTabIdsInMemory;
+}
+
+async function addAgentTabId(tabId) {
+    if (!Number.isInteger(tabId)) return;
+    const ids = await getStoredAgentTabIds();
+    ids.add(tabId);
+    agentTabIdsInMemory = ids;
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) {
+        try {
+            await chrome.storage.session.set({ agentTabIds: Array.from(ids) });
+        } catch (_) {}
+    }
+}
+
+async function removeAgentTabId(tabId) {
+    const ids = await getStoredAgentTabIds();
+    ids.delete(tabId);
+    agentTabIdsInMemory = ids;
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) {
+        try {
+            await chrome.storage.session.set({ agentTabIds: Array.from(ids) });
+        } catch (_) {}
+    }
+}
+
+if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onRemoved) {
+    chrome.tabs.onRemoved.addListener(async (closedTabId) => {
+        await removeAgentTabId(closedTabId);
+    });
+}
 
 const BACKEND_URL = "ws://127.0.0.1:8765/ws/extension";
 
@@ -21,7 +62,7 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 
 
-// Connect to Python backend
+// Connect to Python backend without credentials in URL (Stage 1)
 function connectToBackend() {
     if (
         socket &&
@@ -33,12 +74,17 @@ function connectToBackend() {
 
     console.log("Connecting to backend...");
 
-    const tokenParam = AUTH_TOKEN ? `?token=${encodeURIComponent(AUTH_TOKEN)}` : "";
-    const currentSocket = new WebSocket(`${BACKEND_URL}${tokenParam}`);
+    // Connect with zero credentials in URL
+    const currentSocket = new WebSocket(BACKEND_URL);
     socket = currentSocket;
 
     currentSocket.addEventListener("open", () => {
-        console.log("Connected to Python backend!");
+        console.log("Connected to Python backend! Transmitting AUTH handshake...");
+        // Transmit session token via in-message AUTH handshake
+        currentSocket.send(JSON.stringify({
+            type: "AUTH",
+            token: AUTH_TOKEN
+        }));
         startHeartbeat(currentSocket);
     });
 
@@ -250,6 +296,40 @@ async function getDOMState(targetTabIdParam) {
         }
     }
 
+    // Support empty page extraction for initial about:blank bootstrap (Stage 3)
+    if (targetTab.url === "about:blank") {
+        const ownedIds = await getStoredAgentTabIds();
+        const allTabs = (await chrome.tabs.query({}))
+            .filter(t => t.id !== undefined && (t.url === "about:blank" || /^https?:\/\//i.test(t.url || "")) && ownedIds.has(t.id))
+            .map(t => ({
+                tabId: t.id,
+                url: t.url || "",
+                title: t.title || "",
+                active: t.active
+            }));
+
+        return {
+            url: "about:blank",
+            title: "",
+            tab_id: tabId,
+            eval_page: {
+                rootId: "0",
+                map: {
+                    "0": {
+                        tagName: "body",
+                        xpath: "/html/body",
+                        attributes: {},
+                        children: [],
+                        isVisible: true
+                    }
+                }
+            },
+            pixels_above: 0,
+            pixels_below: 0,
+            all_tabs: allTabs
+        };
+    }
+
     if (!/^https?:\/\//i.test(targetTab.url || "")) {
         throw new Error("This page cannot be inspected: " + (targetTab.url || "unsupported protocol"));
     }
@@ -261,45 +341,67 @@ async function getDOMState(targetTabIdParam) {
         debugMode: false
     };
 
-    let evalPage = null;
+    async function runBuildDomTree() {
+        let evalPage = null;
 
-    // Pattern A: pass self-contained func to chrome.scripting.executeScript
-    try {
-        if (typeof buildDomTree === "function") {
+        // Pattern A: pass self-contained func to chrome.scripting.executeScript
+        try {
+            if (typeof buildDomTree === "function") {
+                const results = await chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: buildDomTree,
+                    args: [defaultArgs]
+                });
+                if (results && results[0] && results[0].result) {
+                    evalPage = results[0].result;
+                }
+            }
+        } catch (patternAError) {
+            if (patternAError?.message?.includes("Execution context was destroyed")) {
+                throw patternAError;
+            }
+            console.warn("Pattern A execution failed, falling back to Pattern B:", patternAError);
+        }
+
+        // Pattern B Fallback: Packaged script execution
+        if (!evalPage) {
+            await chrome.scripting.executeScript({
+                target: { tabId },
+                files: ["injected/buildDomTree.js"]
+            });
+
             const results = await chrome.scripting.executeScript({
                 target: { tabId },
-                func: buildDomTree,
+                func: (args) => {
+                    const fn = window.buildDomTree || globalThis.buildDomTree;
+                    if (typeof fn === "function") {
+                        return fn(args);
+                    }
+                    throw new Error("window.buildDomTree is not defined on target page");
+                },
                 args: [defaultArgs]
             });
+
             if (results && results[0] && results[0].result) {
                 evalPage = results[0].result;
             }
         }
-    } catch (patternAError) {
-        console.warn("Pattern A execution failed, falling back to Pattern B:", patternAError);
+        return evalPage;
     }
 
-    // Pattern B Fallback: Packaged script execution
-    if (!evalPage) {
-        await chrome.scripting.executeScript({
-            target: { tabId },
-            files: ["injected/buildDomTree.js"]
-        });
-
-        const results = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: (args) => {
-                const fn = window.buildDomTree || globalThis.buildDomTree;
-                if (typeof fn === "function") {
-                    return fn(args);
-                }
-                throw new Error("window.buildDomTree is not defined on target page");
-            },
-            args: [defaultArgs]
-        });
-
-        if (results && results[0] && results[0].result) {
-            evalPage = results[0].result;
+    let evalPage = null;
+    try {
+        evalPage = await runBuildDomTree();
+    } catch (err) {
+        if (err?.message?.includes("Execution context was destroyed")) {
+            console.warn("Execution context was destroyed during DOM extraction, waiting for tab to load and retrying once:", err);
+            const loadedTab = await waitForTabLoad(tabId, 15000);
+            if (loadedTab) {
+                targetTab = loadedTab;
+            }
+            evalPage = await runBuildDomTree();
+        } else {
+            throw err;
         }
     }
 
@@ -324,13 +426,11 @@ async function getDOMState(targetTabIdParam) {
 
     const scroll = scrollResults?.[0]?.result || { pixels_above: 0, pixels_below: 0 };
 
-    // Auto-adopt initial inspected tab into agent-owned set (DEF-04)
-    if (agentTabIds.size === 0 && Number.isInteger(tabId)) {
-        agentTabIds.add(tabId);
-    }
+    const ownedIds = await getStoredAgentTabIds();
 
+    // Strict tab filtering: empty ownership set authorizes ZERO tabs (DEF-04)
     const allTabs = (await chrome.tabs.query({}))
-        .filter(t => t.id !== undefined && /^https?:\/\//i.test(t.url || "") && (agentTabIds.size === 0 || agentTabIds.has(t.id)))
+        .filter(t => t.id !== undefined && /^https?:\/\//i.test(t.url || "") && ownedIds.has(t.id))
         .map(t => ({
             tabId: t.id,
             url: t.url || "",
@@ -581,13 +681,21 @@ async function clickElement(tabId, xpath) {
             throw new Error(result?.error || "Click failed");
         }
 
-        // Bounded check for potential navigation triggered by click (DEF-06)
+        // Bounded check for potential navigation triggered by click (DEF-06, Stage 4)
+        // Grace wait of 450ms supports ordinary anchor navigation, immediate JS navigation,
+        // and delayed JS navigation up to 400ms (e.g. setTimeout(..., 400)).
+        // Timing limitation: delayed navigation exceeding the grace window (e.g. >450ms)
+        // cannot be detected synchronously without Chrome DevTools Protocol or webNavigation events.
         try {
             const currentTab = await chrome.tabs.get(tabId);
             if (currentTab.status === "loading") {
                 navigationStarted = true;
             } else {
-                await new Promise(r => setTimeout(r, 250));
+                await new Promise(r => setTimeout(r, 450));
+                const postWaitTab = await chrome.tabs.get(tabId);
+                if (postWaitTab.status === "loading") {
+                    navigationStarted = true;
+                }
             }
         } catch (_) {}
 
@@ -874,6 +982,7 @@ async function executeAction(message, currentSocket) {
                 if (newTab.id === undefined) {
                     throw new Error("Could not create browser tab");
                 }
+                await addAgentTabId(newTab.id);
 
                 const loadedTab = await waitForTabLoad(newTab.id);
 
@@ -909,11 +1018,12 @@ async function executeAction(message, currentSocket) {
 
         else if (action === "CREATE_NEW_TAB") {
             const url = params.url || "about:blank";
-            const newTab = await chrome.tabs.create({ url, active: true });
+            const active = params.active !== undefined ? Boolean(params.active) : false;
+            const newTab = await chrome.tabs.create({ url, active });
             if (newTab.id === undefined) {
                 throw new Error("Could not create browser tab");
             }
-            agentTabIds.add(newTab.id); // Track agent-owned tab (DEF-04)
+            await addAgentTabId(newTab.id); // Persist ownership in session storage (DEF-04)
 
             let loadedTab = null;
             if (url !== "about:blank") {
@@ -934,7 +1044,7 @@ async function executeAction(message, currentSocket) {
         else if (action === "CLOSE_TAB") {
             const targetTabId = await resolveTargetTabId(params.tabId);
             await chrome.tabs.remove(targetTabId);
-            agentTabIds.delete(targetTabId); // Discard from agent ownership (DEF-04)
+            await removeAgentTabId(targetTabId); // Remove from persistent session storage (DEF-04)
 
             sendActionResult({
                 type: "ACTION_RESULT",
@@ -1018,13 +1128,14 @@ async function executeAction(message, currentSocket) {
         else if (action === "GET_TABS") {
 
             const tabs = await chrome.tabs.query({});
+            const ownedIds = await getStoredAgentTabIds();
 
-            // Filter to agent-owned tabs only (DEF-04)
+            // Filter to agent-owned tabs only - empty set authorizes zero tabs (DEF-04)
             const tabList = tabs
                 .filter(tab =>
                     tab.id !== undefined &&
                     /^https?:\/\//i.test(tab.url || "") &&
-                    (agentTabIds.size === 0 || agentTabIds.has(tab.id))
+                    ownedIds.has(tab.id)
                 )
                 .map(tab => ({
                     tabId: tab.id,

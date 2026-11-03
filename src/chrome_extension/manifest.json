@@ -1,12 +1,12 @@
-
 {
   "manifest_version": 3,
   "name": "Browser Agent Connector",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "AI browser automation through Chrome",
   "permissions": [
     "tabs",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "host_permissions": [
     "http://*/*",

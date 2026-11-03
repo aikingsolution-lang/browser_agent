@@ -185,10 +185,16 @@ class ExtensionBrowserContext:
         reconstructs a genuine BrowserState, updates tab/url caches, restricts
         visible tabs to agent-owned tabs, and optionally computes element novelty hashes.
         """
-        if self._current_tab_id is not None:
-            action_data = await self.execute_action("GET_DOM_STATE", {"tabId": self._current_tab_id})
-        else:
-            action_data = await self.execute_action("GET_DOM_STATE")
+        # Bootstrap: If no agent-owned tab exists, create a dedicated about:blank tab (active: false)
+        if self._current_tab_id is None:
+            create_res = await self.execute_action("CREATE_NEW_TAB", {"url": "about:blank", "active": False})
+            result_data = create_res.get("result", {})
+            new_tab_id = result_data.get("tabId") or result_data.get("tab_id")
+            if new_tab_id is None:
+                raise RuntimeError("Failed to bootstrap initial agent tab: no tabId returned from CREATE_NEW_TAB")
+            self.adopt_tab(new_tab_id)
+
+        action_data = await self.execute_action("GET_DOM_STATE", {"tabId": self._current_tab_id})
         raw_result = action_data.get("result", {})
 
         state = await reconstruct_browser_state(raw_result)

@@ -49,6 +49,7 @@ PLAYWRIGHT_ACTIONS = [
     "scroll_up",
     "send_keys",
     "extract_content",
+    "upload_file",
     "scroll_to_text",
     "save_pdf",
     "get_dropdown_options",
@@ -248,6 +249,23 @@ class ExtensionController(CustomController):
             display_text = "***" if has_sensitive_data else params.text
             msg = f'⌨️  Inputted "{display_text}" into element with index {params.index}'
             return ActionResult(extracted_content=msg, include_in_memory=True)
+
+        @self.registry.action(
+            "Upload file to interactive element with file path",
+        )
+        async def upload_file(index: int, path: str, browser: ExtensionBrowserContext, available_file_paths: list[str] = []):
+            """
+            In Chrome Extension architecture without Playwright, arbitrary local file paths cannot
+            be programmatically attached to file inputs due to browser security sandbox constraints.
+            Delegates to human assistant via ask_for_assistant workflow.
+            """
+            msg = (
+                f"Autonomous local file upload for '{path}' at element index {index} is restricted "
+                f"by Chrome Extension security policies. Please use 'ask_for_assistant' so the user "
+                f"can select the file in the browser file dialog."
+            )
+            logger.warning(msg)
+            return ActionResult(error=msg, include_in_memory=True)
 
         # ------------------------------------------------------------------
         # 3. Content Extraction (Extension-backed Replacement for DEF-01)

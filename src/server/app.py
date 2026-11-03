@@ -6,7 +6,11 @@ from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconn
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
-from src.server.security import authenticate_websocket, verify_http_auth
+from src.server.security import (
+    perform_websocket_auth_handshake,
+    verify_http_auth,
+    verify_websocket_headers,
+)
 
 
 app = FastAPI(title="Browser Agent Backend")
@@ -202,25 +206,32 @@ async def execute_action_rpc(request: ActionRequest, token: str = Depends(verify
 async def extension_connection(websocket: WebSocket):
     global extension_socket
 
-    # Authenticate token, host, and origin before accepting
-    if not await authenticate_websocket(websocket):
+    # 1. Validate Host and Origin headers prior to handshake
+    if not await verify_websocket_headers(websocket):
         return
 
-    # Prevent connection hijacking if an authenticated extension is already connected
+    # 2. Prevent socket replacement if another authenticated extension is active
     if extension_socket is not None and extension_socket.client_state == WebSocketState.CONNECTED:
         await websocket.close(code=1008, reason="Another extension connection is already active")
         return
 
+    # 3. Accept raw transport to receive AUTH message
     await websocket.accept()
 
-    extension_socket = websocket
+    # 4. Perform bounded in-message AUTH handshake (5s timeout)
+    if not await perform_websocket_auth_handshake(websocket, timeout=5.0):
+        return
 
+    # 5. Register active authenticated socket ONLY after successful AUTH
+    extension_socket = websocket
     print("Chrome extension authenticated and connected!")
 
+    # 6. Send WELCOME acknowledgement
     async with send_lock:
         await websocket.send_json({
             "type": "WELCOME",
-            "message": "Hello Chrome"
+            "message": "Hello Chrome",
+            "authenticated": True
         })
 
     try:
