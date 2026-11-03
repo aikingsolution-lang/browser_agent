@@ -716,6 +716,41 @@ async function executeAction(message, currentSocket) {
             });
         }
 
+        
+else if (action === "SWITCH_TAB") {
+
+    const tabId = Number(params.tabId);
+
+    if (!Number.isInteger(tabId) || tabId < 0) {
+        throw new Error("Invalid tab ID");
+    }
+
+    // Get the requested tab
+    const tab = await chrome.tabs.get(tabId);
+
+    // Bring its browser window into focus
+    await chrome.windows.update(tab.windowId, {
+        focused: true
+    });
+
+    // Activate the requested tab
+    const updatedTab = await chrome.tabs.update(tabId, {
+        active: true
+    });
+
+    sendResult(currentSocket, {
+        type: "ACTION_RESULT",
+        action: "SWITCH_TAB",
+        success: true,
+        result: {
+            tabId: updatedTab.id,
+            title: updatedTab.title,
+            url: updatedTab.url
+        }
+    });
+}
+
+
 
 
         else {

@@ -27,7 +27,8 @@ class ScrollRequest(BaseModel):
     direction: str = "DOWN"
     amount: int = 600
 
-
+class SwitchTabRequest(BaseModel):
+    tab_id: int
 
 @app.get("/health")
 async def health_check():
@@ -39,6 +40,29 @@ async def health_check():
         )
     }
 
+
+
+@app.post("/test/switch-tab")
+async def test_switch_tab(request: SwitchTabRequest):
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "SWITCH_TAB",
+        "params": {
+            "tabId": request.tab_id
+        }
+    })
+
+    return {
+        "status": "switch_tab_command_sent",
+        "tab_id": request.tab_id
+    }
 
 
 @app.post("/test/tabs")
