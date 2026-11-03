@@ -532,6 +532,56 @@ async function scrollPage(tabId, direction, amount = 600) {
 }
 
 
+function waitForTabLoad(tabId, timeoutMs = 30000) {
+
+    return new Promise((resolve) => {
+
+        let settled = false;
+        let timeoutId;
+
+        function finish(tab = null) {
+
+            if (settled) return;
+
+            settled = true;
+
+            clearTimeout(timeoutId);
+
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+
+            resolve(tab);
+        }
+
+        // Listen for tab loading completion
+        function onUpdated(updatedTabId, changeInfo, tab) {
+
+            if (
+                updatedTabId === tabId &&
+                changeInfo.status === "complete"
+            ) {
+                finish(tab);
+            }
+        }
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+
+        // Prevent waiting forever
+        timeoutId = setTimeout(() => {
+            finish(null);
+        }, timeoutMs);
+
+        // Check whether the page already finished loading
+        chrome.tabs.get(tabId)
+            .then(tab => {
+                if (tab.status === "complete") {
+                    finish(tab);
+                }
+            })
+            .catch(() => finish(null));
+
+    });
+}
+
 
 // Execute browser action
 
@@ -600,27 +650,43 @@ async function executeAction(message, currentSocket) {
         }
 
         // Always open requested websites in a NEW TAB
-        else if (action === "NAVIGATE") {
-            const url = new URL(params.url);
+      
+else if (action === "NAVIGATE") {
 
-            // Only allow HTTP and HTTPS
-            if (!["http:", "https:"].includes(url.protocol)) {
-                throw new Error("Unsupported URL protocol");
-            }
+    const url = new URL(params.url);
 
-            const newTab = await chrome.tabs.create({
-                url: url.href,
-                active: true
-            });
+    if (!["http:", "https:"].includes(url.protocol)) {
+        throw new Error("Unsupported URL protocol");
+    }
 
-            sendResult(currentSocket, {
-                type: "ACTION_RESULT",
-                action: "NAVIGATE",
-                success: true,
-                result: `Opened ${url.href} in a new tab`,
-                tabId: newTab.id
-            });
+    // Create a new tab, preserving existing tabs
+    const newTab = await chrome.tabs.create({
+        url: url.href,
+        active: true
+    });
+
+    if (newTab.id === undefined) {
+        throw new Error("Could not create browser tab");
+    }
+
+    console.log("New tab created:", newTab.id);
+
+    // Wait until webpage finishes loading
+    const loadedTab = await waitForTabLoad(newTab.id);
+
+    sendResult(currentSocket, {
+        type: "ACTION_RESULT",
+        action: "NAVIGATE",
+        success: true,
+        result: {
+            tabId: newTab.id,
+            url: loadedTab?.url || url.href,
+            title: loadedTab?.title || "",
+            loaded: Boolean(loadedTab)
         }
+    });
+}
+
 
 
         else if (action === "PRESS_KEY") {
