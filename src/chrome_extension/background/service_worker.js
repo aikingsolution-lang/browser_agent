@@ -5,6 +5,15 @@ try {
     console.warn("importScripts for buildDomTree failed (will use Pattern B):", importErr);
 }
 
+// Session authentication token (DEF-05)
+try {
+    importScripts("auth_token.js");
+} catch (_) {}
+const AUTH_TOKEN = (typeof self !== "undefined" && self.AUTH_TOKEN) || "";
+
+// Track agent-owned tabs (DEF-04)
+const agentTabIds = new Set();
+
 const BACKEND_URL = "ws://127.0.0.1:8765/ws/extension";
 
 let socket = null;
@@ -24,7 +33,8 @@ function connectToBackend() {
 
     console.log("Connecting to backend...");
 
-    const currentSocket = new WebSocket(BACKEND_URL);
+    const tokenParam = AUTH_TOKEN ? `?token=${encodeURIComponent(AUTH_TOKEN)}` : "";
+    const currentSocket = new WebSocket(`${BACKEND_URL}${tokenParam}`);
     socket = currentSocket;
 
     currentSocket.addEventListener("open", () => {
@@ -81,27 +91,44 @@ function connectToBackend() {
 }
 
 
-async function getPageState() {
-
-    // Find the active Chrome tab
-    const [activeTab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true
-    });
-
-    if (!activeTab || activeTab.id === undefined) {
-        throw new Error("No active browser tab found");
+async function resolveTargetTabId(requestedTabId) {
+    if (requestedTabId === undefined || requestedTabId === null) {
+        throw new Error("Target tabId is required for agent-controlled browser actions");
     }
 
+    const tid = Number(requestedTabId);
+    if (!Number.isInteger(tid) || tid < 0) {
+        throw new Error(`Invalid target tabId: ${requestedTabId}`);
+    }
+
+    try {
+        const tab = await chrome.tabs.get(tid);
+        if (tab && tab.id !== undefined) {
+            return tab.id;
+        }
+    } catch (err) {
+        throw new Error(`Target tab ${tid} is closed or invalid: ${err.message}`);
+    }
+
+    throw new Error(`Target tab ${tid} not found`);
+}
+
+
+async function getPageState(targetTabIdParam) {
+
+    // Resolve explicit target tab ID without active tab fallback
+    const targetTabId = await resolveTargetTabId(targetTabIdParam);
+    const targetTab = await chrome.tabs.get(targetTabId);
+
     // Chrome internal pages cannot be inspected this way
-    if (!/^https?:\/\//i.test(activeTab.url || "")) {
-        throw new Error("This page cannot be inspected");
+    if (!/^https?:\/\//i.test(targetTab.url || "")) {
+        throw new Error("This page cannot be inspected: " + (targetTab.url || "unsupported protocol"));
     }
 
     // Execute JavaScript inside the webpage
     const results = await chrome.scripting.executeScript({
         target: {
-            tabId: activeTab.id
+            tabId: targetTabId
         },
 
         func: () => {
@@ -211,22 +238,21 @@ async function getPageState() {
 }
 
 
-async function getDOMState() {
-    // Find the active Chrome tab
-    const [activeTab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true
-    });
+async function getDOMState(targetTabIdParam) {
+    const tabId = await resolveTargetTabId(targetTabIdParam);
+    let targetTab = await chrome.tabs.get(tabId);
 
-    if (!activeTab || activeTab.id === undefined) {
-        throw new Error("No active browser tab found");
+    // Fix tab loading race: wait for tab to finish loading if in progress
+    if (targetTab.status === "loading") {
+        const loadedTab = await waitForTabLoad(tabId);
+        if (loadedTab) {
+            targetTab = loadedTab;
+        }
     }
 
-    if (!/^https?:\/\//i.test(activeTab.url || "")) {
-        throw new Error("This page cannot be inspected: " + (activeTab.url || "unsupported protocol"));
+    if (!/^https?:\/\//i.test(targetTab.url || "")) {
+        throw new Error("This page cannot be inspected: " + (targetTab.url || "unsupported protocol"));
     }
-
-    const tabId = activeTab.id;
 
     const defaultArgs = {
         doHighlightElements: false,
@@ -298,13 +324,28 @@ async function getDOMState() {
 
     const scroll = scrollResults?.[0]?.result || { pixels_above: 0, pixels_below: 0 };
 
+    // Auto-adopt initial inspected tab into agent-owned set (DEF-04)
+    if (agentTabIds.size === 0 && Number.isInteger(tabId)) {
+        agentTabIds.add(tabId);
+    }
+
+    const allTabs = (await chrome.tabs.query({}))
+        .filter(t => t.id !== undefined && /^https?:\/\//i.test(t.url || "") && (agentTabIds.size === 0 || agentTabIds.has(t.id)))
+        .map(t => ({
+            tabId: t.id,
+            url: t.url || "",
+            title: t.title || "",
+            active: t.active
+        }));
+
     return {
-        url: activeTab.url || "",
-        title: activeTab.title || "",
+        url: targetTab.url || "",
+        title: targetTab.title || "",
         tab_id: tabId,
         eval_page: evalPage,
         pixels_above: scroll.pixels_above,
-        pixels_below: scroll.pixels_below
+        pixels_below: scroll.pixels_below,
+        all_tabs: allTabs
     };
 }
 
@@ -463,137 +504,172 @@ async function typeIntoElement(tabId, xpath, text) {
 
 
 async function clickElement(tabId, xpath) {
-
-    const results = await chrome.scripting.executeScript({
-        target: { tabId },
-
-        args: [xpath],
-
-        func: (xpath) => {
-
-            // Find element using XPath
-            const element = document.evaluate(
-                xpath,
-                document,
-                null,
-                XPathResult.FIRST_ORDERED_NODE_TYPE,
-                null
-            ).singleNodeValue;
-
-            if (!(element instanceof HTMLElement)) {
-                return {
-                    success: false,
-                    error: "Element not found"
-                };
-            }
-
-            // Check visibility
-            const rect = element.getBoundingClientRect();
-            const style = window.getComputedStyle(element);
-
-            if (
-                rect.width === 0 ||
-                rect.height === 0 ||
-                style.display === "none" ||
-                style.visibility === "hidden"
-            ) {
-                return {
-                    success: false,
-                    error: "Element is not visible"
-                };
-            }
-
-            // Check disabled state
-            if (
-                element.matches(":disabled") ||
-                element.getAttribute("aria-disabled") === "true"
-            ) {
-                return {
-                    success: false,
-                    error: "Element is disabled"
-                };
-            }
-
-            // Focus and click
-            element.focus();
-            element.click();
-
-            return {
-                success: true,
-                tag: element.tagName,
-                text: element.innerText || element.textContent || ""
-            };
+    let navigationStarted = false;
+    const onUpdated = (updatedTabId, changeInfo) => {
+        if (updatedTabId === tabId && (changeInfo.status === "loading" || changeInfo.url)) {
+            navigationStarted = true;
         }
-    });
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
 
-    const result = results?.[0]?.result;
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
 
-    if (!result?.success) {
-        throw new Error(result?.error || "Click failed");
+            args: [xpath],
+
+            func: (xpath) => {
+
+                // Find element using XPath
+                const element = document.evaluate(
+                    xpath,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+
+                if (!(element instanceof HTMLElement)) {
+                    return {
+                        success: false,
+                        error: "Element not found"
+                    };
+                }
+
+                // Check visibility
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+
+                if (
+                    rect.width === 0 ||
+                    rect.height === 0 ||
+                    style.display === "none" ||
+                    style.visibility === "hidden"
+                ) {
+                    return {
+                        success: false,
+                        error: "Element is not visible"
+                    };
+                }
+
+                // Check disabled state
+                if (
+                    element.matches(":disabled") ||
+                    element.getAttribute("aria-disabled") === "true"
+                ) {
+                    return {
+                        success: false,
+                        error: "Element is disabled"
+                    };
+                }
+
+                // Focus and click
+                element.focus();
+                element.click();
+
+                return {
+                    success: true,
+                    tag: element.tagName,
+                    text: element.innerText || element.textContent || ""
+                };
+            }
+        });
+
+        const result = results?.[0]?.result;
+
+        if (!result?.success) {
+            throw new Error(result?.error || "Click failed");
+        }
+
+        // Bounded check for potential navigation triggered by click (DEF-06)
+        try {
+            const currentTab = await chrome.tabs.get(tabId);
+            if (currentTab.status === "loading") {
+                navigationStarted = true;
+            } else {
+                await new Promise(r => setTimeout(r, 250));
+            }
+        } catch (_) {}
+
+        if (navigationStarted) {
+            await waitForTabLoad(tabId, 15000);
+        }
+
+        return result;
+    } finally {
+        chrome.tabs.onUpdated.removeListener(onUpdated);
     }
-
-    return result;
 }
 
 
 async function pressKeyOnElement(tabId, xpath, key) {
 
-    if (key.toUpperCase() !== "ENTER") {
-        throw new Error("Currently only ENTER is supported");
-    }
-
     const results = await chrome.scripting.executeScript({
         target: { tabId },
-        args: [xpath],
+        args: [xpath || "", key || ""],
 
-        func: (xpath) => {
+        func: (xpath, key) => {
 
-            // Find the element
-            const element = document.evaluate(
-                xpath,
-                document,
-                null,
-                XPathResult.FIRST_ORDERED_NODE_TYPE,
-                null
-            ).singleNodeValue;
+            let element = null;
+            if (xpath) {
+                element = document.evaluate(
+                    xpath,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
 
-            if (!(element instanceof HTMLInputElement)) {
-                return {
-                    success: false,
-                    error: "Target must be an input element"
-                };
+                if (!element && !xpath.startsWith("/")) {
+                    element = document.evaluate(
+                        "/" + xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null
+                    ).singleNodeValue;
+                }
             }
 
-            if (
-                element.disabled ||
-                element.readOnly ||
-                ["password", "file", "hidden"].includes(element.type)
-            ) {
-                return {
-                    success: false,
-                    error: "Input cannot be submitted"
-                };
+            if (!element) {
+                element = document.activeElement || document.body;
             }
 
-            const form = element.form;
-
-            if (!form) {
-                return {
-                    success: false,
-                    error: "Input has no associated form"
-                };
+            if (element && typeof element.focus === "function") {
+                element.focus();
             }
 
-            // Focus input
-            element.focus();
+            const isEnter = key && key.toUpperCase() === "ENTER";
+            const keyCode = isEnter ? 13 : (key && key.toUpperCase() === "TAB" ? 9 : (key && key.toUpperCase() === "ESCAPE" ? 27 : 0));
+            const keyEventInit = {
+                key: key,
+                code: isEnter ? "Enter" : key,
+                keyCode: keyCode,
+                which: keyCode,
+                charCode: keyCode,
+                bubbles: true,
+                cancelable: true,
+                composed: true
+            };
 
-            // Submit using browser's native form behavior
-            form.requestSubmit();
+            element.dispatchEvent(new KeyboardEvent("keydown", keyEventInit));
+            element.dispatchEvent(new KeyboardEvent("keypress", keyEventInit));
+            element.dispatchEvent(new KeyboardEvent("keyup", keyEventInit));
+
+            // If Enter, trigger form.requestSubmit() via element.form or closest form ancestor (DEF-07)
+            if (isEnter && element instanceof HTMLElement) {
+                const form = element.form || (typeof element.closest === "function" ? element.closest("form") : null);
+                if (form && typeof form.requestSubmit === "function") {
+                    try {
+                        form.requestSubmit();
+                    } catch (_) {}
+                }
+            }
 
             return {
                 success: true,
-                key: "ENTER",
-                method: "requestSubmit"
+                key: key,
+                targetTag: element ? element.tagName : "NONE"
             };
         }
     });
@@ -601,7 +677,18 @@ async function pressKeyOnElement(tabId, xpath, key) {
     const result = results?.[0]?.result;
 
     if (!result?.success) {
-        throw new Error(result?.error || "Enter action failed");
+        throw new Error(result?.error || "Key action failed");
+    }
+
+    // If Enter was pressed, check for navigation load (DEF-06/DEF-07)
+    if (key && key.toUpperCase() === "ENTER") {
+        try {
+            await new Promise(r => setTimeout(r, 200));
+            const tab = await chrome.tabs.get(tabId);
+            if (tab && tab.status === "loading") {
+                await waitForTabLoad(tabId, 15000);
+            }
+        } catch (_) {}
     }
 
     return result;
@@ -716,7 +803,7 @@ async function executeAction(message, currentSocket) {
 
         // Read webpage information
         if (action === "GET_STATE") {
-            const state = await getPageState();
+            const state = await getPageState(params.tabId);
 
             sendActionResult({
                 type: "ACTION_RESULT",
@@ -726,7 +813,7 @@ async function executeAction(message, currentSocket) {
             });
         }
         else if (action === "GET_DOM_STATE") {
-            const domState = await getDOMState();
+            const domState = await getDOMState(params.tabId);
 
             sendActionResult({
                 type: "ACTION_RESULT",
@@ -737,17 +824,10 @@ async function executeAction(message, currentSocket) {
         }
         else if (action === "TYPE") {
 
-            const [activeTab] = await chrome.tabs.query({
-                active: true,
-                lastFocusedWindow: true
-            });
-
-            if (!activeTab || activeTab.id === undefined) {
-                throw new Error("No active tab found");
-            }
+            const targetTabId = await resolveTargetTabId(params.tabId);
 
             const result = await typeIntoElement(
-                activeTab.id,
+                targetTabId,
                 params.xpath,
                 params.text
             );
@@ -762,17 +842,10 @@ async function executeAction(message, currentSocket) {
 
         else if (action === "CLICK") {
 
-            const [activeTab] = await chrome.tabs.query({
-                active: true,
-                lastFocusedWindow: true
-            });
-
-            if (!activeTab || activeTab.id === undefined) {
-                throw new Error("No active tab found");
-            }
+            const targetTabId = await resolveTargetTabId(params.tabId);
 
             const result = await clickElement(
-                activeTab.id,
+                targetTabId,
                 params.xpath
             );
 
@@ -784,59 +857,119 @@ async function executeAction(message, currentSocket) {
             });
         }
 
-        // Always open requested websites in a NEW TAB
-      
-else if (action === "NAVIGATE") {
+        else if (action === "NAVIGATE") {
 
-    const url = new URL(params.url);
+            const url = new URL(params.url);
 
-    if (!["http:", "https:"].includes(url.protocol)) {
-        throw new Error("Unsupported URL protocol");
-    }
+            if (!["http:", "https:"].includes(url.protocol)) {
+                throw new Error("Unsupported URL protocol");
+            }
 
-    // Create a new tab, preserving existing tabs
-    const newTab = await chrome.tabs.create({
-        url: url.href,
-        active: true
-    });
+            if (params.newTab) {
+                const newTab = await chrome.tabs.create({
+                    url: url.href,
+                    active: true
+                });
 
-    if (newTab.id === undefined) {
-        throw new Error("Could not create browser tab");
-    }
+                if (newTab.id === undefined) {
+                    throw new Error("Could not create browser tab");
+                }
 
-    console.log("New tab created:", newTab.id);
+                const loadedTab = await waitForTabLoad(newTab.id);
 
-    // Wait until webpage finishes loading
-    const loadedTab = await waitForTabLoad(newTab.id);
+                sendActionResult({
+                    type: "ACTION_RESULT",
+                    action: "NAVIGATE",
+                    success: true,
+                    result: {
+                        tabId: newTab.id,
+                        url: loadedTab?.url || url.href,
+                        title: loadedTab?.title || "",
+                        loaded: Boolean(loadedTab)
+                    }
+                });
+            } else {
+                const targetTabId = await resolveTargetTabId(params.tabId);
+                await chrome.tabs.update(targetTabId, { url: url.href });
+                const loadedTab = await waitForTabLoad(targetTabId);
 
-    sendActionResult({
-        type: "ACTION_RESULT",
-        action: "NAVIGATE",
-        success: true,
-        result: {
-            tabId: newTab.id,
-            url: loadedTab?.url || url.href,
-            title: loadedTab?.title || "",
-            loaded: Boolean(loadedTab)
+                sendActionResult({
+                    type: "ACTION_RESULT",
+                    action: "NAVIGATE",
+                    success: true,
+                    result: {
+                        tabId: targetTabId,
+                        url: loadedTab?.url || url.href,
+                        title: loadedTab?.title || "",
+                        loaded: Boolean(loadedTab)
+                    }
+                });
+            }
         }
-    });
-}
 
+        else if (action === "CREATE_NEW_TAB") {
+            const url = params.url || "about:blank";
+            const newTab = await chrome.tabs.create({ url, active: true });
+            if (newTab.id === undefined) {
+                throw new Error("Could not create browser tab");
+            }
+            agentTabIds.add(newTab.id); // Track agent-owned tab (DEF-04)
 
+            let loadedTab = null;
+            if (url !== "about:blank") {
+                loadedTab = await waitForTabLoad(newTab.id);
+            }
+            sendActionResult({
+                type: "ACTION_RESULT",
+                action: "CREATE_NEW_TAB",
+                success: true,
+                result: {
+                    tabId: newTab.id,
+                    url: loadedTab?.url || newTab.url || url,
+                    title: loadedTab?.title || ""
+                }
+            });
+        }
+
+        else if (action === "CLOSE_TAB") {
+            const targetTabId = await resolveTargetTabId(params.tabId);
+            await chrome.tabs.remove(targetTabId);
+            agentTabIds.delete(targetTabId); // Discard from agent ownership (DEF-04)
+
+            sendActionResult({
+                type: "ACTION_RESULT",
+                action: "CLOSE_TAB",
+                success: true,
+                result: {
+                    tabId: targetTabId,
+                    closed: true
+                }
+            });
+        }
+
+        else if (action === "GO_BACK") {
+            const targetTabId = await resolveTargetTabId(params.tabId);
+            await chrome.scripting.executeScript({
+                target: { tabId: targetTabId },
+                func: () => window.history.back()
+            });
+            await waitForTabLoad(targetTabId);
+            sendActionResult({
+                type: "ACTION_RESULT",
+                action: "GO_BACK",
+                success: true,
+                result: {
+                    tabId: targetTabId
+                }
+            });
+        }
 
         else if (action === "PRESS_KEY") {
 
-            const [activeTab] = await chrome.tabs.query({
-                active: true,
-                lastFocusedWindow: true
-            });
-
-            if (!activeTab || activeTab.id === undefined) {
-                throw new Error("No active tab found");
-            }
+            const targetTabId = await resolveTargetTabId(params.tabId);
 
             const result = await pressKeyOnElement(
-                activeTab.id,
+                targetTabId,
                 params.xpath,
                 params.key
             );
@@ -849,17 +982,9 @@ else if (action === "NAVIGATE") {
             });
         }
 
-
         else if (action === "SCROLL") {
 
-            const [activeTab] = await chrome.tabs.query({
-                active: true,
-                lastFocusedWindow: true
-            });
-
-            if (!activeTab || activeTab.id === undefined) {
-                throw new Error("No active tab found");
-            }
+            const targetTabId = await resolveTargetTabId(params.tabId);
 
             const direction = params.direction || "DOWN";
             const amount = params.amount || 600;
@@ -877,7 +1002,7 @@ else if (action === "NAVIGATE") {
             }
 
             const result = await scrollPage(
-                activeTab.id,
+                targetTabId,
                 direction,
                 amount
             );
@@ -890,16 +1015,16 @@ else if (action === "NAVIGATE") {
             });
         }
 
-
-
         else if (action === "GET_TABS") {
 
             const tabs = await chrome.tabs.query({});
 
+            // Filter to agent-owned tabs only (DEF-04)
             const tabList = tabs
                 .filter(tab =>
                     tab.id !== undefined &&
-                    /^https?:\/\//i.test(tab.url || "")
+                    /^https?:\/\//i.test(tab.url || "") &&
+                    (agentTabIds.size === 0 || agentTabIds.has(tab.id))
                 )
                 .map(tab => ({
                     tabId: tab.id,
@@ -914,6 +1039,39 @@ else if (action === "NAVIGATE") {
                 action: "GET_TABS",
                 success: true,
                 result: tabList
+            });
+        }
+
+        else if (action === "GET_PAGE_CONTENT") {
+            const targetTabId = await resolveTargetTabId(params.tabId);
+            const results = await chrome.scripting.executeScript({
+                target: { tabId: targetTabId },
+                args: [Boolean(params.stripLinkUrls)],
+                func: (stripLinkUrls) => {
+                    const body = document.body;
+                    if (!body) return { content: "" };
+                    const clone = body.cloneNode(true);
+                    const toRemove = clone.querySelectorAll("script, style, noscript, svg");
+                    toRemove.forEach(el => el.remove());
+                    if (stripLinkUrls) {
+                        const links = clone.querySelectorAll("a, img");
+                        links.forEach(el => {
+                            el.removeAttribute("href");
+                            el.removeAttribute("src");
+                        });
+                    }
+                    return {
+                        content: (clone.innerText || clone.textContent || "").trim()
+                    };
+                }
+            });
+
+            const result = results?.[0]?.result || { content: "" };
+            sendActionResult({
+                type: "ACTION_RESULT",
+                action: "GET_PAGE_CONTENT",
+                success: true,
+                result: result
             });
         }
 

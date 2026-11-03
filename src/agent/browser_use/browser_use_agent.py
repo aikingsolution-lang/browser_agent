@@ -18,6 +18,11 @@ from browser_use.browser.views import BrowserStateHistory
 from browser_use.utils import time_execution_async
 from dotenv import load_dotenv
 from browser_use.agent.message_manager.utils import is_model_without_tool_support
+from typing import Any
+from langchain_core.language_models.chat_models import BaseChatModel
+from src.browser.extension_browser import ExtensionBrowser
+from src.browser.extension_context import ExtensionBrowserContext
+from src.controller.extension_controller import ExtensionController
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -28,6 +33,40 @@ SKIP_LLM_API_KEY_VERIFICATION = (
 
 
 class BrowserUseAgent(Agent):
+    def __init__(
+        self,
+        task: str,
+        llm: BaseChatModel,
+        browser: Any = None,
+        browser_context: Any = None,
+        controller: Any = None,
+        use_extension: bool = True,
+        **kwargs,
+    ):
+        if use_extension:
+            if browser is None:
+                browser = ExtensionBrowser()
+            if browser_context is None:
+                browser_context = ExtensionBrowserContext()
+            if controller is None:
+                controller = ExtensionController()
+
+        super().__init__(
+            task=task,
+            llm=llm,
+            browser=browser,
+            browser_context=browser_context,
+            controller=controller,
+            **kwargs,
+        )
+
+    async def close(self) -> None:
+        """Clean shutdown ensuring injected extension browser/context resources are closed."""
+        await super().close()
+        if isinstance(self.browser_context, ExtensionBrowserContext):
+            await self.browser_context.close()
+        if isinstance(self.browser, ExtensionBrowser):
+            await self.browser.close()
     def _set_tool_calling_method(self) -> ToolCallingMethod | None:
         tool_calling_method = self.settings.tool_calling_method
         if tool_calling_method == 'auto':

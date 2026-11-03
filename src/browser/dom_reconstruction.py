@@ -58,12 +58,29 @@ async def reconstruct_browser_state(raw_data: dict[str, Any]) -> BrowserState:
     # Use the actual Chrome tab ID in TabInfo (do not hardcode page_id=0)
     tab_info = TabInfo(page_id=tab_id, url=url, title=title)
 
+    # Populate all relevant open tabs if returned by extension
+    all_tabs_data = raw_data.get("all_tabs")
+    if all_tabs_data and isinstance(all_tabs_data, list):
+        tabs = [
+            TabInfo(
+                page_id=t.get("tabId", 0),
+                url=t.get("url", ""),
+                title=t.get("title", ""),
+            )
+            for t in all_tabs_data
+            if "tabId" in t
+        ]
+        if not any(t.page_id == tab_id for t in tabs):
+            tabs.append(tab_info)
+    else:
+        tabs = [tab_info]
+
     return BrowserState(
         element_tree=element_tree,
         selector_map=selector_map,
         url=url,
         title=title,
-        tabs=[tab_info],
+        tabs=tabs,
         screenshot=None,
         pixels_above=pixels_above,
         pixels_below=pixels_below,

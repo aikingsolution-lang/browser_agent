@@ -190,3 +190,7 @@ data/
 *.pdf
 
 workflow
+
+# Chrome Extension Auth Token
+src/chrome_extension/background/auth_token.js
+.extension_token

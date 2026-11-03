@@ -1,17 +1,18 @@
-
 import asyncio
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
+
+from src.server.security import authenticate_websocket, verify_http_auth
 
 
 app = FastAPI(title="Browser Agent Backend")
 
 
-# Temporary: one extension connection for local development
+# Active extension connection for browser operations
 extension_socket: WebSocket | None = None
 
 
@@ -33,7 +34,12 @@ SUPPORTED_ACTIONS = {
     "PRESS_KEY",
     "SCROLL",
     "GET_TABS",
-    "SWITCH_TAB"
+    "SWITCH_TAB",
+    "CREATE_NEW_TAB",
+    "CLOSE_TAB",
+    "GO_BACK",
+    "GET_PAGE_CONTENT",
+    "EXTRACT_CONTENT",
 }
 
 
@@ -57,7 +63,6 @@ async def execute_browser_action(
     action: str,
     params: dict[str, Any]
 ):
-
     global extension_socket
 
     # Verify extension connection
@@ -87,10 +92,8 @@ async def execute_browser_action(
     pending_actions[request_id] = future
 
     try:
-
         # Send command to Chrome extension
         async with send_lock:
-
             if (
                 extension_socket is None
                 or extension_socket.client_state != WebSocketState.CONNECTED
@@ -120,7 +123,6 @@ async def execute_browser_action(
         return result
 
     except asyncio.TimeoutError:
-
         raise HTTPException(
             status_code=504,
             detail=f"Browser action timed out: {action}"
@@ -130,14 +132,12 @@ async def execute_browser_action(
         raise
 
     except Exception as error:
-
         raise HTTPException(
             status_code=503,
             detail=f"Browser communication failed: {error}"
         )
 
     finally:
-
         # Always clean up the pending request
         pending_actions.pop(request_id, None)
 
@@ -151,7 +151,6 @@ async def execute_browser_action(
 
 @app.get("/health")
 async def health_check():
-
     return {
         "status": "ok",
         "extension_connected": (
@@ -167,8 +166,24 @@ async def health_check():
 # --------------------------------------------------
 
 @app.post("/test/action")
-async def test_action(request: ActionRequest):
+async def test_action(request: ActionRequest, token: str = Depends(verify_http_auth)):
+    action = request.action.strip().upper()
 
+    result = await execute_browser_action(
+        action=action,
+        params=request.params
+    )
+
+    return result
+
+
+@app.post("/api/v1/action")
+async def execute_action_rpc(request: ActionRequest, token: str = Depends(verify_http_auth)):
+    """
+    Production internal RPC endpoint for ExtensionBrowserContext and controllers.
+    Dispatches browser actions to the Chrome Extension via WebSocket.
+    Requires Bearer token authentication.
+    """
     action = request.action.strip().upper()
 
     result = await execute_browser_action(
@@ -185,14 +200,22 @@ async def test_action(request: ActionRequest):
 
 @app.websocket("/ws/extension")
 async def extension_connection(websocket: WebSocket):
-
     global extension_socket
+
+    # Authenticate token, host, and origin before accepting
+    if not await authenticate_websocket(websocket):
+        return
+
+    # Prevent connection hijacking if an authenticated extension is already connected
+    if extension_socket is not None and extension_socket.client_state == WebSocketState.CONNECTED:
+        await websocket.close(code=1008, reason="Another extension connection is already active")
+        return
 
     await websocket.accept()
 
     extension_socket = websocket
 
-    print("Chrome extension connected!")
+    print("Chrome extension authenticated and connected!")
 
     async with send_lock:
         await websocket.send_json({
@@ -201,9 +224,7 @@ async def extension_connection(websocket: WebSocket):
         })
 
     try:
-
         while True:
-
             # Receive messages from Chrome
             data = await websocket.receive_json()
 
@@ -211,7 +232,6 @@ async def extension_connection(websocket: WebSocket):
 
             # Handshake
             if message_type == "HELLO":
-
                 print("Chrome handshake completed!")
 
                 async with send_lock:
@@ -222,46 +242,34 @@ async def extension_connection(websocket: WebSocket):
 
             # Browser action result
             elif message_type == "ACTION_RESULT":
-
                 request_id = data.get("request_id")
 
                 future = pending_actions.get(request_id)
 
                 if future is not None and not future.done():
-
                     # Resolve the Future with the actual browser result
                     future.set_result(data)
-
                     print(f"Received action result: {request_id}")
-
                 else:
-
                     print(f"Unmatched action result: {request_id}")
 
             # Heartbeat
             elif message_type == "HEARTBEAT":
-
-                # Connection activity received
                 pass
 
             else:
-
-                print("Unknown extension message:", data)
+                print("Unknown extension message type:", message_type)
 
     except WebSocketDisconnect:
-
         print("Chrome extension disconnected!")
 
     finally:
-
         # Only clear the connection if this is still the active socket
         if extension_socket is websocket:
-
             extension_socket = None
 
             # Fail any actions still waiting for responses
             for future in list(pending_actions.values()):
-
                 if not future.done():
                     future.set_exception(
                         ConnectionError("Chrome extension disconnected")
