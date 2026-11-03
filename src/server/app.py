@@ -15,7 +15,10 @@ class NavigateRequest(BaseModel):
 class TypeRequest(BaseModel):
     xpath: str
     text: str
-    
+
+class ClickRequest(BaseModel):
+    xpath: str   
+
 @app.get("/health")
 async def health_check():
     return {
@@ -65,6 +68,26 @@ async def test_type(request: TypeRequest):
     })
 
     return {"status": "type_command_sent"}
+
+
+@app.post("/test/click")
+async def test_click(request: ClickRequest):
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "CLICK",
+        "params": {
+            "xpath": request.xpath
+        }
+    })
+
+    return {"status": "click_command_sent"}
 
 @app.post("/test/state")
 async def test_page_state():

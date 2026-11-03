@@ -347,6 +347,80 @@ async function typeIntoElement(tabId, xpath, text) {
 }
 
 
+async function clickElement(tabId, xpath) {
+
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+
+        args: [xpath],
+
+        func: (xpath) => {
+
+            // Find element using XPath
+            const element = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+
+            if (!(element instanceof HTMLElement)) {
+                return {
+                    success: false,
+                    error: "Element not found"
+                };
+            }
+
+            // Check visibility
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+
+            if (
+                rect.width === 0 ||
+                rect.height === 0 ||
+                style.display === "none" ||
+                style.visibility === "hidden"
+            ) {
+                return {
+                    success: false,
+                    error: "Element is not visible"
+                };
+            }
+
+            // Check disabled state
+            if (
+                element.matches(":disabled") ||
+                element.getAttribute("aria-disabled") === "true"
+            ) {
+                return {
+                    success: false,
+                    error: "Element is disabled"
+                };
+            }
+
+            // Focus and click
+            element.focus();
+            element.click();
+
+            return {
+                success: true,
+                tag: element.tagName,
+                text: element.innerText || element.textContent || ""
+            };
+        }
+    });
+
+    const result = results?.[0]?.result;
+
+    if (!result?.success) {
+        throw new Error(result?.error || "Click failed");
+    }
+
+    return result;
+}
+
+
 // Execute browser action
 
 async function executeAction(message, currentSocket) {
@@ -366,28 +440,52 @@ async function executeAction(message, currentSocket) {
         }
         else if (action === "TYPE") {
 
-    const [activeTab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true
-    });
+            const [activeTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true
+            });
 
-    if (!activeTab || activeTab.id === undefined) {
-        throw new Error("No active tab found");
-    }
+            if (!activeTab || activeTab.id === undefined) {
+                throw new Error("No active tab found");
+            }
 
-    const result = await typeIntoElement(
-        activeTab.id,
-        params.xpath,
-        params.text
-    );
+            const result = await typeIntoElement(
+                activeTab.id,
+                params.xpath,
+                params.text
+            );
 
-    sendResult(currentSocket, {
-        type: "ACTION_RESULT",
-        action: "TYPE",
-        success: true,
-        result: result
-    });
-}
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "TYPE",
+                success: true,
+                result: result
+            });
+        }
+
+        else if (action === "CLICK") {
+
+            const [activeTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true
+            });
+
+            if (!activeTab || activeTab.id === undefined) {
+                throw new Error("No active tab found");
+            }
+
+            const result = await clickElement(
+                activeTab.id,
+                params.xpath
+            );
+
+            sendResult(currentSocket, {
+                type: "ACTION_RESULT",
+                action: "CLICK",
+                success: true,
+                result: result
+            });
+        }
 
         // Always open requested websites in a NEW TAB
         else if (action === "NAVIGATE") {
