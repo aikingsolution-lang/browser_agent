@@ -204,6 +204,149 @@ async function getPageState() {
     return results[0].result;
 }
 
+async function typeIntoElement(tabId, xpath, text) {
+
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+
+        args: [xpath, text],
+
+        func: (xpath, text) => {
+
+            // Find element using XPath
+            const element = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+
+            if (!(element instanceof HTMLElement)) {
+                return {
+                    success: false,
+                    error: "Element not found"
+                };
+            }
+
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+
+            if (
+                !rect.width ||
+                !rect.height ||
+                style.display === "none" ||
+                style.visibility === "hidden"
+            ) {
+                return {
+                    success: false,
+                    error: "Element is not visible"
+                };
+            }
+
+            // Handle input and textarea
+            if (
+                element instanceof HTMLInputElement ||
+                element instanceof HTMLTextAreaElement
+            ) {
+
+                if (element.disabled || element.readOnly) {
+                    return {
+                        success: false,
+                        error: "Element is not editable"
+                    };
+                }
+
+                // Never type into password or file inputs
+                if (
+                    element instanceof HTMLInputElement &&
+                    ["password", "file", "hidden"].includes(element.type)
+                ) {
+                    return {
+                        success: false,
+                        error: "Unsupported input type"
+                    };
+                }
+
+                element.focus();
+
+                // Use the native value setter.
+                // This helps controlled frameworks detect changes.
+                const prototype =
+                    element instanceof HTMLInputElement
+                        ? HTMLInputElement.prototype
+                        : HTMLTextAreaElement.prototype;
+
+                const setter = Object.getOwnPropertyDescriptor(
+                    prototype,
+                    "value"
+                )?.set;
+
+                if (!setter) {
+                    return {
+                        success: false,
+                        error: "Could not update input value"
+                    };
+                }
+
+                setter.call(element, text);
+
+                element.dispatchEvent(
+                    new InputEvent("input", {
+                        bubbles: true,
+                        inputType: "insertText",
+                        data: text
+                    })
+                );
+
+                element.dispatchEvent(
+                    new Event("change", { bubbles: true })
+                );
+
+                return {
+                    success: true,
+                    tag: element.tagName,
+                    placeholder: element.getAttribute("placeholder")
+                };
+            }
+
+            // Handle contenteditable elements
+            if (element.isContentEditable) {
+
+                element.focus();
+                element.textContent = text;
+
+                element.dispatchEvent(
+                    new InputEvent("input", {
+                        bubbles: true,
+                        inputType: "insertText",
+                        data: text
+                    })
+                );
+
+                return {
+                    success: true,
+                    tag: element.tagName
+                };
+            }
+
+            return {
+                success: false,
+                error: "Element is not a supported text field"
+            };
+        }
+    });
+
+    const result = results?.[0]?.result;
+
+    if (!result?.success) {
+        throw new Error(result?.error || "Typing failed");
+    }
+
+    return result;
+}
+
+
 // Execute browser action
 
 async function executeAction(message, currentSocket) {
@@ -221,6 +364,30 @@ async function executeAction(message, currentSocket) {
                 result: state
             });
         }
+        else if (action === "TYPE") {
+
+    const [activeTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+
+    if (!activeTab || activeTab.id === undefined) {
+        throw new Error("No active tab found");
+    }
+
+    const result = await typeIntoElement(
+        activeTab.id,
+        params.xpath,
+        params.text
+    );
+
+    sendResult(currentSocket, {
+        type: "ACTION_RESULT",
+        action: "TYPE",
+        success: true,
+        result: result
+    });
+}
 
         // Always open requested websites in a NEW TAB
         else if (action === "NAVIGATE") {

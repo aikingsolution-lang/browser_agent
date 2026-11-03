@@ -12,7 +12,10 @@ extension_socket: WebSocket | None = None
 class NavigateRequest(BaseModel):
     url: HttpUrl
 
-
+class TypeRequest(BaseModel):
+    xpath: str
+    text: str
+    
 @app.get("/health")
 async def health_check():
     return {
@@ -43,6 +46,25 @@ async def test_navigation(request: NavigateRequest):
 
     return {"status": "command_sent", "url": str(request.url)}
 
+@app.post("/test/type")
+async def test_type(request: TypeRequest):
+
+    if (
+        extension_socket is None
+        or extension_socket.client_state != WebSocketState.CONNECTED
+    ):
+        return {"error": "Chrome extension is not connected"}
+
+    await extension_socket.send_json({
+        "type": "EXECUTE_ACTION",
+        "action": "TYPE",
+        "params": {
+            "xpath": request.xpath,
+            "text": request.text
+        }
+    })
+
+    return {"status": "type_command_sent"}
 
 @app.post("/test/state")
 async def test_page_state():
