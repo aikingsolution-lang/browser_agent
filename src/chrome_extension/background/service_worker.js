@@ -586,6 +586,16 @@ function waitForTabLoad(tabId, timeoutMs = 30000) {
 // Execute browser action
 
 async function executeAction(message, currentSocket) {
+
+        // Send action response with its original request ID
+    const sendActionResult = (payload) => {
+
+        sendResult(currentSocket, {
+            ...payload,
+            request_id: message.request_id ?? null
+        });
+
+    };
     try {
         const { action, params = {} } = message;
 
@@ -593,7 +603,7 @@ async function executeAction(message, currentSocket) {
         if (action === "GET_STATE") {
             const state = await getPageState();
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "GET_STATE",
                 success: true,
@@ -617,7 +627,7 @@ async function executeAction(message, currentSocket) {
                 params.text
             );
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "TYPE",
                 success: true,
@@ -641,7 +651,7 @@ async function executeAction(message, currentSocket) {
                 params.xpath
             );
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "CLICK",
                 success: true,
@@ -674,7 +684,7 @@ else if (action === "NAVIGATE") {
     // Wait until webpage finishes loading
     const loadedTab = await waitForTabLoad(newTab.id);
 
-    sendResult(currentSocket, {
+    sendActionResult({
         type: "ACTION_RESULT",
         action: "NAVIGATE",
         success: true,
@@ -706,7 +716,7 @@ else if (action === "NAVIGATE") {
                 params.key
             );
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "PRESS_KEY",
                 success: true,
@@ -747,7 +757,7 @@ else if (action === "NAVIGATE") {
                 amount
             );
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "SCROLL",
                 success: true,
@@ -774,7 +784,7 @@ else if (action === "NAVIGATE") {
                     windowId: tab.windowId
                 }));
 
-            sendResult(currentSocket, {
+            sendActionResult({
                 type: "ACTION_RESULT",
                 action: "GET_TABS",
                 success: true,
@@ -804,7 +814,7 @@ else if (action === "SWITCH_TAB") {
         active: true
     });
 
-    sendResult(currentSocket, {
+    sendActionResult({
         type: "ACTION_RESULT",
         action: "SWITCH_TAB",
         success: true,
@@ -824,7 +834,7 @@ else if (action === "SWITCH_TAB") {
         }
 
     } catch (error) {
-        sendResult(currentSocket, {
+        sendActionResult({
             type: "ACTION_RESULT",
             action: message.action,
             success: false,
