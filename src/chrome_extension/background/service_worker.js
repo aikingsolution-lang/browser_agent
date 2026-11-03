@@ -205,12 +205,13 @@ async function getPageState() {
 }
 
 // Execute browser action
+
 async function executeAction(message, currentSocket) {
     try {
         const { action, params = {} } = message;
 
+        // Read webpage information
         if (action === "GET_STATE") {
-
             const state = await getPageState();
 
             sendResult(currentSocket, {
@@ -219,40 +220,32 @@ async function executeAction(message, currentSocket) {
                 success: true,
                 result: state
             });
+        }
 
-        } else if (action === "NAVIGATE") {
+        // Always open requested websites in a NEW TAB
+        else if (action === "NAVIGATE") {
             const url = new URL(params.url);
 
-            // Only allow regular web URLs
+            // Only allow HTTP and HTTPS
             if (!["http:", "https:"].includes(url.protocol)) {
                 throw new Error("Unsupported URL protocol");
             }
 
-            // Get currently active Chrome tab
-            const [activeTab] = await chrome.tabs.query({
-                active: true,
-                lastFocusedWindow: true
+            const newTab = await chrome.tabs.create({
+                url: url.href,
+                active: true
             });
-
-            // Navigate existing tab or create a new one
-            if (activeTab?.id !== undefined) {
-                await chrome.tabs.update(activeTab.id, {
-                    url: url.href
-                });
-            } else {
-                await chrome.tabs.create({
-                    url: url.href
-                });
-            }
 
             sendResult(currentSocket, {
                 type: "ACTION_RESULT",
                 action: "NAVIGATE",
                 success: true,
-                result: `Navigated to ${url.href}`
+                result: `Opened ${url.href} in a new tab`,
+                tabId: newTab.id
             });
+        }
 
-        } else {
+        else {
             throw new Error(`Unsupported action: ${action}`);
         }
 
@@ -265,6 +258,7 @@ async function executeAction(message, currentSocket) {
         });
     }
 }
+
 
 
 // Send action result to Python
