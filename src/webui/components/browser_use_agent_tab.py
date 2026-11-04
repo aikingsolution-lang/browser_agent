@@ -18,9 +18,11 @@ from browser_use.browser.views import BrowserState
 from gradio.components import Component
 from langchain_core.language_models.chat_models import BaseChatModel
 
+import httpx
 from src.agent.browser_use.browser_use_agent import BrowserUseAgent
-from src.browser.custom_browser import CustomBrowser
-from src.controller.custom_controller import CustomController
+from src.browser.extension_browser import ExtensionBrowser
+from src.browser.extension_context import ExtensionBrowserContext
+from src.controller.extension_controller import ExtensionController
 from src.utils import llm_provider
 from src.webui.webui_manager import WebuiManager
 
@@ -222,7 +224,7 @@ def _handle_done(webui_manager: WebuiManager, history: AgentHistoryList):
 
 
 async def _ask_assistant_callback(
-        webui_manager: WebuiManager, query: str, browser_context: BrowserContext
+        webui_manager: WebuiManager, query: str, browser_context: Any
 ) -> Dict[str, Any]:
     """Callback triggered by the agent's ask_for_assistant action."""
     logger.info("Agent requires assistance. Waiting for user input.")
@@ -322,6 +324,62 @@ async def run_agent_task(
         gif_comp: gr.update(value=None),
     }
 
+    # --- Pre-flight Check: FastAPI health & Chrome Extension connection ---
+    backend_url = os.getenv("EXTENSION_SERVER_URL", "http://127.0.0.1:8765").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as health_client:
+            health_resp = await health_client.get(f"{backend_url}/health")
+            if health_resp.status_code != 200:
+                err_msg = f"FastAPI backend health check failed with HTTP {health_resp.status_code}."
+                logger.error(err_msg)
+                gr.Error(err_msg)
+                webui_manager.bu_chat_history.append({"role": "assistant", "content": f"**Connection Error:** {err_msg}"})
+                yield {
+                    user_input_comp: gr.update(interactive=True, placeholder="Enter task..."),
+                    run_button_comp: gr.update(value="▶️ Submit Task", interactive=True),
+                    stop_button_comp: gr.update(value="⏹️ Stop", interactive=False),
+                    pause_resume_button_comp: gr.update(value="⏸️ Pause", interactive=False),
+                    clear_button_comp: gr.update(interactive=True),
+                    chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
+                }
+                return
+
+            health_data = health_resp.json()
+            if not health_data.get("extension_connected", False):
+                err_msg = (
+                    "Chrome Extension is not connected to FastAPI backend. "
+                    "Please ensure Google Chrome is open with the AI Kings extension active."
+                )
+                logger.error(err_msg)
+                gr.Error(err_msg)
+                webui_manager.bu_chat_history.append({"role": "assistant", "content": f"**Connection Error:** {err_msg}"})
+                yield {
+                    user_input_comp: gr.update(interactive=True, placeholder="Enter task..."),
+                    run_button_comp: gr.update(value="▶️ Submit Task", interactive=True),
+                    stop_button_comp: gr.update(value="⏹️ Stop", interactive=False),
+                    pause_resume_button_comp: gr.update(value="⏸️ Pause", interactive=False),
+                    clear_button_comp: gr.update(interactive=True),
+                    chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
+                }
+                return
+    except Exception as e:
+        err_msg = (
+            f"Cannot reach FastAPI server at {backend_url}. "
+            "Please ensure the backend server is running."
+        )
+        logger.error(f"{err_msg}: {e}")
+        gr.Error(err_msg)
+        webui_manager.bu_chat_history.append({"role": "assistant", "content": f"**Connection Error:** {err_msg}"})
+        yield {
+            user_input_comp: gr.update(interactive=True, placeholder="Enter task..."),
+            run_button_comp: gr.update(value="▶️ Submit Task", interactive=True),
+            stop_button_comp: gr.update(value="⏹️ Stop", interactive=False),
+            pause_resume_button_comp: gr.update(value="⏸️ Pause", interactive=False),
+            clear_button_comp: gr.update(interactive=True),
+            chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
+        }
+        return
+
     # --- Agent Settings ---
     # Access settings values via components dict, getting IDs from webui_manager
     def get_setting(key, default=None):
@@ -335,7 +393,7 @@ async def run_agent_task(
     )  # Default to None if not found
     llm_model_name = get_setting("llm_model_name", None)
     llm_temperature = get_setting("llm_temperature", 0.6)
-    use_vision = get_setting("use_vision", True)
+    use_vision = False  # Screenshots not supported in Extension architecture
     ollama_num_ctx = get_setting("ollama_num_ctx", 16000)
     llm_base_url = get_setting("llm_base_url") or None
     llm_api_key = get_setting("llm_api_key") or None
@@ -364,7 +422,7 @@ async def run_agent_task(
         planner_ollama_num_ctx = get_setting("planner_ollama_num_ctx", 16000)
         planner_llm_base_url = get_setting("planner_llm_base_url") or None
         planner_llm_api_key = get_setting("planner_llm_api_key") or None
-        planner_use_vision = get_setting("planner_use_vision", False)
+        planner_use_vision = False  # Screenshots not supported in Extension architecture
 
         planner_llm = await _initialize_llm(
             planner_llm_provider_name,
@@ -380,33 +438,15 @@ async def run_agent_task(
         comp = webui_manager.id_to_component.get(f"browser_settings.{key}")
         return components.get(comp, default) if comp else default
 
-    browser_binary_path = get_browser_setting("browser_binary_path") or None
-    browser_user_data_dir = get_browser_setting("browser_user_data_dir") or None
-    use_own_browser = get_browser_setting(
-        "use_own_browser", False
-    )  # Logic handled by CDP/WSS presence
-    keep_browser_open = get_browser_setting("keep_browser_open", False)
-    headless = get_browser_setting("headless", False)
-    disable_security = get_browser_setting("disable_security", False)
+    keep_browser_open = get_browser_setting("keep_browser_open", True)
     window_w = int(get_browser_setting("window_w", 1280))
     window_h = int(get_browser_setting("window_h", 1100))
-    cdp_url = get_browser_setting("cdp_url") or None
-    wss_url = get_browser_setting("wss_url") or None
-    save_recording_path = get_browser_setting("save_recording_path") or None
-    save_trace_path = get_browser_setting("save_trace_path") or None
     save_agent_history_path = get_browser_setting(
         "save_agent_history_path", "./tmp/agent_history"
     )
     save_download_path = get_browser_setting("save_download_path", "./tmp/downloads")
 
-    stream_vw = 70
-    stream_vh = int(70 * window_h // window_w)
-
     os.makedirs(save_agent_history_path, exist_ok=True)
-    if save_recording_path:
-        os.makedirs(save_recording_path, exist_ok=True)
-    if save_trace_path:
-        os.makedirs(save_trace_path, exist_ok=True)
     if save_download_path:
         os.makedirs(save_download_path, exist_ok=True)
 
@@ -424,76 +464,67 @@ async def run_agent_task(
 
     # Pass the webui_manager instance to the callback when wrapping it
     async def ask_callback_wrapper(
-            query: str, browser_context: BrowserContext
+            query: str, browser_context: Any
     ) -> Dict[str, Any]:
         return await _ask_assistant_callback(webui_manager, query, browser_context)
 
-    if not webui_manager.bu_controller:
-        webui_manager.bu_controller = CustomController(
+    # --- 3. Close Legacy/Non-Extension Resources ---
+    if webui_manager.bu_browser and not isinstance(webui_manager.bu_browser, ExtensionBrowser):
+        logger.info("Closing previous non-extension browser.")
+        try:
+            await webui_manager.bu_browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing legacy browser: {e}")
+        webui_manager.bu_browser = None
+
+    if webui_manager.bu_browser_context and not isinstance(webui_manager.bu_browser_context, ExtensionBrowserContext):
+        logger.info("Closing previous non-extension browser context.")
+        try:
+            await webui_manager.bu_browser_context.close()
+        except Exception as e:
+            logger.warning(f"Error closing legacy context: {e}")
+        webui_manager.bu_browser_context = None
+
+    # Close previous extension resources if not keeping open
+    if not keep_browser_open:
+        if webui_manager.bu_browser_context:
+            logger.info("Closing previous extension browser context.")
+            try:
+                await webui_manager.bu_browser_context.close()
+            except Exception as e:
+                logger.warning(f"Error closing previous extension context: {e}")
+            webui_manager.bu_browser_context = None
+        if webui_manager.bu_browser:
+            logger.info("Closing previous extension browser.")
+            try:
+                await webui_manager.bu_browser.close()
+            except Exception as e:
+                logger.warning(f"Error closing previous extension browser: {e}")
+            webui_manager.bu_browser = None
+
+    # --- 4. Initialize Extension Controller, Browser and Context ---
+    if not webui_manager.bu_controller or not isinstance(webui_manager.bu_controller, ExtensionController):
+        webui_manager.bu_controller = ExtensionController(
             ask_assistant_callback=ask_callback_wrapper
         )
         await webui_manager.bu_controller.setup_mcp_client(mcp_server_config)
 
-    # --- 4. Initialize Browser and Context ---
     should_close_browser_on_finish = not keep_browser_open
 
     try:
-        # Close existing resources if not keeping open
-        if not keep_browser_open:
-            if webui_manager.bu_browser_context:
-                logger.info("Closing previous browser context.")
-                await webui_manager.bu_browser_context.close()
-                webui_manager.bu_browser_context = None
-            if webui_manager.bu_browser:
-                logger.info("Closing previous browser.")
-                await webui_manager.bu_browser.close()
-                webui_manager.bu_browser = None
-
-        # Create Browser if needed
         if not webui_manager.bu_browser:
-            logger.info("Launching new browser instance.")
-            extra_args = []
-            if use_own_browser:
-                browser_binary_path = os.getenv("BROWSER_PATH", None) or browser_binary_path
-                if browser_binary_path == "":
-                    browser_binary_path = None
-                browser_user_data = browser_user_data_dir or os.getenv("BROWSER_USER_DATA", None)
-                if browser_user_data:
-                    extra_args += [f"--user-data-dir={browser_user_data}"]
-            else:
-                browser_binary_path = None
+            logger.info("Initializing ExtensionBrowser instance.")
+            webui_manager.bu_browser = ExtensionBrowser()
 
-            webui_manager.bu_browser = CustomBrowser(
-                config=BrowserConfig(
-                    headless=headless,
-                    disable_security=disable_security,
-                    browser_binary_path=browser_binary_path,
-                    extra_browser_args=extra_args,
-                    wss_url=wss_url,
-                    cdp_url=cdp_url,
-                    new_context_config=BrowserContextConfig(
-                        window_width=window_w,
-                        window_height=window_h,
-                    )
-                )
-            )
+        # If previous context is marked closed, discard it so a new context is created
+        if webui_manager.bu_browser_context and getattr(webui_manager.bu_browser_context, "is_closed", False):
+            logger.info("Previous extension browser context is closed. Discarding reference.")
+            webui_manager.bu_browser_context = None
 
-        # Create Context if needed
         if not webui_manager.bu_browser_context:
-            logger.info("Creating new browser context.")
-            context_config = BrowserContextConfig(
-                trace_path=save_trace_path if save_trace_path else None,
-                save_recording_path=save_recording_path
-                if save_recording_path
-                else None,
-                save_downloads_path=save_download_path if save_download_path else None,
-                window_height=window_h,
-                window_width=window_w,
-            )
-            if not webui_manager.bu_browser:
-                raise ValueError("Browser not initialized, cannot create context.")
-            webui_manager.bu_browser_context = (
-                await webui_manager.bu_browser.new_context(config=context_config)
+            logger.info("Initializing ExtensionBrowserContext instance.")
+            webui_manager.bu_browser_context = ExtensionBrowserContext(
+                server_url=backend_url,
             )
 
         # --- 5. Initialize or Update Agent ---
@@ -536,35 +567,43 @@ async def run_agent_task(
                 controller=webui_manager.bu_controller,
                 register_new_step_callback=step_callback_wrapper,
                 register_done_callback=done_callback_wrapper,
-                use_vision=use_vision,
+                use_vision=False,
                 override_system_message=override_system_prompt,
                 extend_system_message=extend_system_prompt,
                 max_input_tokens=max_input_tokens,
                 max_actions_per_step=max_actions,
                 tool_calling_method=tool_calling_method,
                 planner_llm=planner_llm,
-                use_vision_for_planner=planner_use_vision if planner_llm else False,
+                use_vision_for_planner=False,
                 source="webui",
+                use_extension=True,
             )
             webui_manager.bu_agent.state.agent_id = webui_manager.bu_agent_task_id
-            webui_manager.bu_agent.settings.generate_gif = gif_path
+            webui_manager.bu_agent.settings.generate_gif = False
         else:
             webui_manager.bu_agent.state.agent_id = webui_manager.bu_agent_task_id
             webui_manager.bu_agent.add_new_task(task)
-            webui_manager.bu_agent.settings.generate_gif = gif_path
+            webui_manager.bu_agent.settings.generate_gif = False
             webui_manager.bu_agent.browser = webui_manager.bu_browser
             webui_manager.bu_agent.browser_context = webui_manager.bu_browser_context
             webui_manager.bu_agent.controller = webui_manager.bu_controller
 
+        # Hold local references so background operations / Clear clicks cannot cause
+        # NoneType attribute errors if webui_manager references are cleared concurrently.
+        local_agent = webui_manager.bu_agent
+        local_context = webui_manager.bu_browser_context
+        local_browser = webui_manager.bu_browser
+        local_controller = webui_manager.bu_controller
+
         # --- 6. Run Agent Task and Stream Updates ---
-        agent_run_coro = webui_manager.bu_agent.run(max_steps=max_steps)
+        agent_run_coro = local_agent.run(max_steps=max_steps)
         agent_task = asyncio.create_task(agent_run_coro)
         webui_manager.bu_current_task = agent_task  # Store the task
 
         last_chat_len = len(webui_manager.bu_chat_history)
         while not agent_task.done():
-            is_paused = webui_manager.bu_agent.state.paused
-            is_stopped = webui_manager.bu_agent.state.stopped
+            is_paused = getattr(getattr(local_agent, "state", None), "paused", False)
+            is_stopped = getattr(getattr(local_agent, "state", None), "stopped", False)
 
             # Check for pause state
             if is_paused:
@@ -576,9 +615,9 @@ async def run_agent_task(
                 }
                 # Wait until pause is released or task is stopped/done
                 while is_paused and not agent_task.done():
-                    # Re-check agent state in loop
-                    is_paused = webui_manager.bu_agent.state.paused
-                    is_stopped = webui_manager.bu_agent.state.stopped
+                    # Re-check agent state in loop safely
+                    is_paused = getattr(getattr(local_agent, "state", None), "paused", False)
+                    is_stopped = getattr(getattr(local_agent, "state", None), "stopped", False)
                     if is_stopped:  # Stop signal received while paused
                         break
                     await asyncio.sleep(0.2)
@@ -658,30 +697,8 @@ async def run_agent_task(
                 )
                 last_chat_len = len(webui_manager.bu_chat_history)
 
-            # Update Browser View
-            if headless and webui_manager.bu_browser_context:
-                try:
-                    screenshot_b64 = (
-                        await webui_manager.bu_browser_context.take_screenshot()
-                    )
-                    if screenshot_b64:
-                        html_content = f'<img src="data:image/jpeg;base64,{screenshot_b64}" style="width:{stream_vw}vw; height:{stream_vh}vh ; border:1px solid #ccc;">'
-                        update_dict[browser_view_comp] = gr.update(
-                            value=html_content, visible=True
-                        )
-                    else:
-                        html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>"
-                        update_dict[browser_view_comp] = gr.update(
-                            value=html_content, visible=True
-                        )
-                except Exception as e:
-                    logger.debug(f"Failed to capture screenshot: {e}")
-                    update_dict[browser_view_comp] = gr.update(
-                        value="<div style='...'>Error loading view...</div>",
-                        visible=True,
-                    )
-            else:
-                update_dict[browser_view_comp] = gr.update(visible=False)
+            # Update Browser View (not supported in Extension mode)
+            update_dict[browser_view_comp] = gr.update(visible=False)
 
             # Yield accumulated updates
             if update_dict:
@@ -690,20 +707,24 @@ async def run_agent_task(
             await asyncio.sleep(0.1)  # Polling interval
 
         # --- 7. Task Finalization ---
-        webui_manager.bu_agent.state.paused = False
-        webui_manager.bu_agent.state.stopped = False
+        if local_agent and hasattr(local_agent, "state") and local_agent.state:
+            local_agent.state.paused = False
+            local_agent.state.stopped = False
         final_update = {}
         try:
             logger.info("Agent task completing...")
             # Await the task ensure completion and catch exceptions if not already caught
             if not agent_task.done():
                 await agent_task  # Retrieve result/exception
+            elif agent_task.cancelled():
+                logger.info("Agent task was cancelled.")
             elif agent_task.exception():  # Check if task finished with exception
                 agent_task.result()  # Raise the exception to be caught below
             logger.info("Agent task completed processing.")
 
-            logger.info(f"Explicitly saving agent history to: {history_file}")
-            webui_manager.bu_agent.save_history(history_file)
+            if local_agent and hasattr(local_agent, "save_history"):
+                logger.info(f"Explicitly saving agent history to: {history_file}")
+                local_agent.save_history(history_file)
 
             if os.path.exists(history_file):
                 final_update[history_file_comp] = gr.File(value=history_file)
@@ -741,17 +762,26 @@ async def run_agent_task(
 
         finally:
             webui_manager.bu_current_task = None  # Clear the task reference
+            webui_manager.bu_is_running = False
 
             # Close browser/context if requested
             if should_close_browser_on_finish:
-                if webui_manager.bu_browser_context:
+                if local_context:
                     logger.info("Closing browser context after task.")
-                    await webui_manager.bu_browser_context.close()
-                    webui_manager.bu_browser_context = None
-                if webui_manager.bu_browser:
+                    try:
+                        await local_context.close()
+                    except Exception as e:
+                        logger.error(f"Error closing browser context: {e}")
+                    if webui_manager.bu_browser_context is local_context:
+                        webui_manager.bu_browser_context = None
+                if local_browser:
                     logger.info("Closing browser after task.")
-                    await webui_manager.bu_browser.close()
-                    webui_manager.bu_browser = None
+                    try:
+                        await local_browser.close()
+                    except Exception as e:
+                        logger.error(f"Error closing browser: {e}")
+                    if webui_manager.bu_browser is local_browser:
+                        webui_manager.bu_browser = None
 
             # --- 8. Final UI Update ---
             final_update.update(
@@ -777,6 +807,7 @@ async def run_agent_task(
         # Catch errors during setup (before agent run starts)
         logger.error(f"Error setting up agent task: {e}", exc_info=True)
         webui_manager.bu_current_task = None  # Ensure state is reset
+        webui_manager.bu_is_running = False
         yield {
             user_input_comp: gr.update(
                 interactive=True, placeholder="Error during setup. Enter task..."
@@ -790,6 +821,8 @@ async def run_agent_task(
                       + [{"role": "assistant", "content": f"**Setup Error:** {e}"}]
             ),
         }
+    finally:
+        webui_manager.bu_is_running = False
 
 
 # --- Button Click Handlers --- (Need access to webui_manager)
@@ -820,19 +853,27 @@ async def handle_submit(
                 "browser_use_agent.run_button"
             ): gr.update(value="⏳ Running...", interactive=False),
         }
-    # Check if a task is currently running (using _current_task)
-    elif webui_manager.bu_current_task and not webui_manager.bu_current_task.done():
+    # Check if a task is currently running (concurrency guard)
+    elif (
+        webui_manager.bu_is_running
+        or (webui_manager.bu_current_task and not webui_manager.bu_current_task.done())
+    ):
         logger.warning(
             "Submit button clicked while agent is already running and not asking for help."
         )
         gr.Info("Agent is currently running. Please wait or use Stop/Pause.")
-        yield {}  # No change
+        yield {}  # Block concurrent execution
+        return
     else:
         # Handle submission for a new task
         logger.info("Submit button clicked for new task.")
-        # Use async generator to stream updates from run_agent_task
-        async for update in run_agent_task(webui_manager, components):
-            yield update
+        webui_manager.bu_is_running = True
+        try:
+            # Use async generator to stream updates from run_agent_task
+            async for update in run_agent_task(webui_manager, components):
+                yield update
+        finally:
+            webui_manager.bu_is_running = False
 
 
 async def handle_stop(webui_manager: WebuiManager):
@@ -841,10 +882,11 @@ async def handle_stop(webui_manager: WebuiManager):
     agent = webui_manager.bu_agent
     task = webui_manager.bu_current_task
 
-    if agent and task and not task.done():
+    if (agent or task) and (task and not task.done()):
         # Signal the agent to stop by setting its internal flag
-        agent.state.stopped = True
-        agent.state.paused = False  # Ensure not paused if stopped
+        if agent and hasattr(agent, "state") and agent.state:
+            agent.state.stopped = True
+            agent.state.paused = False  # Ensure not paused if stopped
         return {
             webui_manager.get_component_by_id(
                 "browser_use_agent.stop_button"
@@ -880,7 +922,7 @@ async def handle_pause_resume(webui_manager: WebuiManager):
     agent = webui_manager.bu_agent
     task = webui_manager.bu_current_task
 
-    if agent and task and not task.done():
+    if agent and task and not task.done() and hasattr(agent, "state") and agent.state:
         if agent.state.paused:
             logger.info("Resume button clicked.")
             agent.resume()
@@ -909,26 +951,57 @@ async def handle_clear(webui_manager: WebuiManager):
     """Handles clicks on the 'Clear' button."""
     logger.info("Clear button clicked.")
 
-    # Stop any running task first
+    # 1. Stop any running task first
+    agent = webui_manager.bu_agent
     task = webui_manager.bu_current_task
+    if agent and hasattr(agent, "state") and agent.state:
+        try:
+            agent.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping agent on clear: {e}")
+
     if task and not task.done():
         logger.info("Clearing requires stopping the current task.")
-        webui_manager.bu_agent.stop()
         task.cancel()
         try:
-            await asyncio.wait_for(task, timeout=2.0)  # Wait briefly
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)  # Wait briefly
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
         except Exception as e:
             logger.warning(f"Error stopping task on clear: {e}")
-    webui_manager.bu_current_task = None
 
+    webui_manager.bu_current_task = None
+    webui_manager.bu_is_running = False
+
+    # 2. Close MCP client and clear controller
     if webui_manager.bu_controller:
-        await webui_manager.bu_controller.close_mcp_client()
+        try:
+            await webui_manager.bu_controller.close_mcp_client()
+        except Exception as e:
+            logger.warning(f"Error closing MCP client on clear: {e}")
         webui_manager.bu_controller = None
+
+    # 3. Clean up browser context and agent-owned tabs
+    if webui_manager.bu_browser_context:
+        logger.info("Closing browser context and agent tabs on clear.")
+        try:
+            await webui_manager.bu_browser_context.close()
+        except Exception as e:
+            logger.warning(f"Error closing browser context on clear: {e}")
+        webui_manager.bu_browser_context = None
+
+    # 4. Clean up browser
+    if webui_manager.bu_browser:
+        logger.info("Closing browser on clear.")
+        try:
+            await webui_manager.bu_browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing browser on clear: {e}")
+        webui_manager.bu_browser = None
+
     webui_manager.bu_agent = None
 
-    # Reset state stored in manager
+    # 5. Reset state stored in manager
     webui_manager.bu_chat_history = []
     webui_manager.bu_response_event = None
     webui_manager.bu_user_help_response = None

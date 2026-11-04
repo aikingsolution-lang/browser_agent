@@ -16,6 +16,12 @@ import secrets
 from pathlib import Path
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from fastapi import Header, HTTPException, WebSocket, status
 
 

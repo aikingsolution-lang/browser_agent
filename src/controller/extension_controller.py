@@ -6,8 +6,6 @@ FastAPI /api/v1/action and executed in Chrome via WebSocket.
 Subclasses CustomController to retain custom tools (ask_for_assistant, upload_file, MCP).
 """
 
-from __future__ import annotations
-
 import asyncio
 import inspect
 import logging

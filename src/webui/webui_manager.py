@@ -13,9 +13,9 @@ from gradio.components import Component
 from browser_use.browser.browser import Browser
 from browser_use.browser.context import BrowserContext
 from browser_use.agent.service import Agent
-from src.browser.custom_browser import CustomBrowser
-from src.browser.custom_context import CustomBrowserContext
-from src.controller.custom_controller import CustomController
+from src.browser.extension_browser import ExtensionBrowser
+from src.browser.extension_context import ExtensionBrowserContext
+from src.controller.extension_controller import ExtensionController
 from src.agent.deep_research.deep_research_agent import DeepResearchAgent
 
 
@@ -32,14 +32,15 @@ class WebuiManager:
         init browser use agent
         """
         self.bu_agent: Optional[Agent] = None
-        self.bu_browser: Optional[CustomBrowser] = None
-        self.bu_browser_context: Optional[CustomBrowserContext] = None
-        self.bu_controller: Optional[CustomController] = None
+        self.bu_browser: Optional[ExtensionBrowser] = None
+        self.bu_browser_context: Optional[ExtensionBrowserContext] = None
+        self.bu_controller: Optional[ExtensionController] = None
         self.bu_chat_history: List[Dict[str, Optional[str]]] = []
         self.bu_response_event: Optional[asyncio.Event] = None
         self.bu_user_help_response: Optional[str] = None
         self.bu_current_task: Optional[asyncio.Task] = None
         self.bu_agent_task_id: Optional[str] = None
+        self.bu_is_running: bool = False
 
     def init_deep_research_agent(self) -> None:
         """

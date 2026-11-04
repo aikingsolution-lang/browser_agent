@@ -9,8 +9,11 @@ All operations dispatch via HTTP RPC to the FastAPI server at /api/v1/action.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import httpx
 from browser_use.browser.context import (
@@ -98,6 +101,14 @@ class ExtensionBrowserContext:
 
         # Strict agent-owned tab tracking (DEF-04)
         self.agent_tab_ids: set[int] = set()
+
+        # Closed status tracking
+        self._closed: bool = False
+
+    @property
+    def is_closed(self) -> bool:
+        """Returns True if close() has been called on this context."""
+        return self._closed
 
     @property
     def state(self) -> BrowserState | None:
@@ -194,7 +205,26 @@ class ExtensionBrowserContext:
                 raise RuntimeError("Failed to bootstrap initial agent tab: no tabId returned from CREATE_NEW_TAB")
             self.adopt_tab(new_tab_id)
 
-        action_data = await self.execute_action("GET_DOM_STATE", {"tabId": self._current_tab_id})
+        try:
+            action_data = await self.execute_action("GET_DOM_STATE", {"tabId": self._current_tab_id})
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "closed or invalid" in err_str or "no tab with id" in err_str:
+                logger.warning(
+                    f"Agent tab {self._current_tab_id} is closed or invalid. Bootstrapping a fresh agent tab."
+                )
+                self.agent_tab_ids.discard(self._current_tab_id)
+                self._current_tab_id = None
+                create_res = await self.execute_action("CREATE_NEW_TAB", {"url": "about:blank", "active": False})
+                result_data = create_res.get("result", {})
+                new_tab_id = result_data.get("tabId") or result_data.get("tab_id")
+                if new_tab_id is None:
+                    raise RuntimeError("Failed to bootstrap recovery agent tab: no tabId returned from CREATE_NEW_TAB")
+                self.adopt_tab(new_tab_id)
+                action_data = await self.execute_action("GET_DOM_STATE", {"tabId": self._current_tab_id})
+            else:
+                raise
+
         raw_result = action_data.get("result", {})
 
         state = await reconstruct_browser_state(raw_result)
@@ -296,12 +326,28 @@ class ExtensionBrowserContext:
         """
         pass
 
+    async def take_screenshot(self) -> str | None:
+        """Screenshots are not supported in Extension mode."""
+        return None
+
     async def close(self) -> None:
         """
-        Cleans up HTTP client resources.
-        Does NOT close Chrome.
+        Cleans up agent-owned tabs and HTTP client resources.
+        Does NOT close human-owned Chrome tabs or terminate the browser.
         Does NOT launch or terminate Playwright.
         """
+        self._closed = True
+
+        # Close only agent-owned tabs (DEF-04)
+        tabs_to_close = list(self.agent_tab_ids)
+        for tab_id in tabs_to_close:
+            try:
+                await self.execute_action("CLOSE_TAB", {"tabId": tab_id})
+            except Exception as e:
+                logger.debug(f"Error closing agent-owned tab {tab_id}: {e}")
+        self.agent_tab_ids.clear()
+        self._current_tab_id = None
+
         if self._http_client is not None and not self._http_client.is_closed:
             await self._http_client.aclose()
             self._http_client = None
