@@ -15,6 +15,7 @@ Tests cover:
 
 import asyncio
 import json
+import os
 import unittest
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from typing import Any
 from browser_use.browser.views import BrowserState, TabInfo
 from browser_use.dom.views import DOMElementNode
 from src.browser.dom_reconstruction import reconstruct_browser_state
+from src.server.security import AUTH_TOKEN_ENV_VAR, SESSION_AUTH_TOKEN
+from tests.local_fixture_server import LocalFixtureServer
 
 
 def get_sample_fixture() -> dict[str, Any]:
@@ -193,51 +196,106 @@ class TestLiveExtensionConnection(unittest.TestCase):
         if not connected:
             self.skipTest("Live Chrome Extension is not currently connected to FastAPI on ws://127.0.0.1:8765 - skipping live test")
 
+        token = os.getenv(AUTH_TOKEN_ENV_VAR) or SESSION_AUTH_TOKEN
+        headers = {"Authorization": f"Bearer {token}"}
+
+        server = LocalFixtureServer()
+        server_url = server.start()
+
         async def run_live_test():
             import httpx
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # 1. Request DOM state from live extension
-                res = await client.post(
+                # 1. Create a dedicated agent-owned tab
+                create_res = await client.post(
                     "http://127.0.0.1:8765/test/action",
-                    json={"action": "GET_DOM_STATE", "params": {}}
+                    headers=headers,
+                    json={"action": "CREATE_NEW_TAB", "params": {"url": "about:blank", "active": False}}
                 )
-                self.assertEqual(res.status_code, 200, f"GET_DOM_STATE request failed: {res.text}")
-                action_data = res.json()
+                self.assertEqual(create_res.status_code, 200, f"CREATE_NEW_TAB request failed: {create_res.text}")
+                create_data = create_res.json()
+                self.assertTrue(create_data.get("success"), f"Failed to create new tab: {create_data}")
+                tab_id = create_data.get("result", {}).get("tabId")
+                self.assertIsNotNone(tab_id, "CREATE_NEW_TAB did not return a valid tabId")
 
-                # If the connected extension is running an older service worker, inform tester
-                if not action_data.get("success") and "Unsupported action: GET_DOM_STATE" in str(action_data.get("error")):
-                    return "EXTENSION_NEEDS_RELOAD"
+                try:
+                    # 2. Navigate to local fixture
+                    nav_res = await client.post(
+                        "http://127.0.0.1:8765/test/action",
+                        headers=headers,
+                        json={"action": "NAVIGATE", "params": {"url": server_url, "tabId": tab_id}}
+                    )
+                    self.assertEqual(nav_res.status_code, 200, f"NAVIGATE failed: {nav_res.text}")
+                    self.assertTrue(nav_res.json().get("success"), f"NAVIGATE returned error: {nav_res.json()}")
 
-                self.assertTrue(action_data.get("success"), f"Extension returned failure: {action_data}")
+                    # 3. Extract DOM state from live extension
+                    res = await client.post(
+                        "http://127.0.0.1:8765/test/action",
+                        headers=headers,
+                        json={"action": "GET_DOM_STATE", "params": {"tabId": tab_id}}
+                    )
+                    self.assertEqual(res.status_code, 200, f"GET_DOM_STATE request failed: {res.text}")
+                    action_data = res.json()
 
-                raw_result = action_data.get("result", {})
-                self.assertIn("eval_page", raw_result)
+                    # If the connected extension is running an older service worker, inform tester
+                    if not action_data.get("success") and "Unsupported action: GET_DOM_STATE" in str(action_data.get("error")):
+                        return "EXTENSION_NEEDS_RELOAD"
 
-                # 2. Reconstruct BrowserState
-                state = await reconstruct_browser_state(raw_result)
-                self.assertIsInstance(state, BrowserState)
-                self.assertGreater(len(state.selector_map), 0, "No clickable elements found on active tab")
+                    self.assertTrue(action_data.get("success"), f"Extension returned failure: {action_data}")
+                    raw_result = action_data.get("result", {})
+                    self.assertIn("eval_page", raw_result)
 
-                # 3. Select first available interactive element
-                first_index = next(iter(state.selector_map.keys()))
-                target_node = state.selector_map[first_index]
+                    # 4. Reconstruct BrowserState
+                    state = await reconstruct_browser_state(raw_result)
+                    self.assertIsInstance(state, BrowserState)
+                    self.assertEqual(state.title, "Fixture Initial")
+                    self.assertGreater(len(state.selector_map), 0, "No clickable elements found on fixture tab")
 
-                # 4. Dispatch click via XPath
-                click_res = await client.post(
-                    "http://127.0.0.1:8765/test/action",
-                    json={"action": "CLICK", "params": {"xpath": target_node.xpath}}
+                    # 5. Find the button through returned selector/XPath information
+                    button_nodes = [node for node in state.selector_map.values() if node.tag_name.lower() == "button"]
+                    self.assertTrue(len(button_nodes) > 0, "Button element not found in selector map")
+                    target_node = button_nodes[0]
+
+                    # 6. Dispatch click via XPath
+                    click_res = await client.post(
+                        "http://127.0.0.1:8765/test/action",
+                        headers=headers,
+                        json={"action": "CLICK", "params": {"tabId": tab_id, "xpath": target_node.xpath}}
+                    )
+                    self.assertEqual(click_res.status_code, 200)
+                    click_data = click_res.json()
+                    self.assertTrue(click_data.get("success"), f"Click failed on xpath {target_node.xpath}: {click_data}")
+
+                    # 7. Verify page title changes to 'clicked' by retrieving fresh browser state
+                    fresh_res = await client.post(
+                        "http://127.0.0.1:8765/test/action",
+                        headers=headers,
+                        json={"action": "GET_DOM_STATE", "params": {"tabId": tab_id}}
+                    )
+                    self.assertEqual(fresh_res.status_code, 200)
+                    fresh_state = await reconstruct_browser_state(fresh_res.json().get("result", {}))
+                    self.assertEqual(fresh_state.title, "clicked", f"Expected title 'clicked', got '{fresh_state.title}'")
+
+                    return "SUCCESS"
+                finally:
+                    # Clean up agent-owned tab
+                    try:
+                        await client.post(
+                            "http://127.0.0.1:8765/test/action",
+                            headers=headers,
+                            json={"action": "CLOSE_TAB", "params": {"tabId": tab_id}}
+                        )
+                    except Exception:
+                        pass
+
+        try:
+            result = asyncio.run(run_live_test())
+            if result == "EXTENSION_NEEDS_RELOAD":
+                self.skipTest(
+                    "Chrome Extension is connected, but running an earlier service_worker.js build. "
+                    "Please reload the extension in chrome://extensions to activate the new GET_DOM_STATE action."
                 )
-                self.assertEqual(click_res.status_code, 200)
-                click_data = click_res.json()
-                self.assertTrue(click_data.get("success"), f"Click failed on xpath {target_node.xpath}: {click_data}")
-                return "SUCCESS"
-
-        result = asyncio.run(run_live_test())
-        if result == "EXTENSION_NEEDS_RELOAD":
-            self.skipTest(
-                "Chrome Extension is connected, but running an earlier service_worker.js build. "
-                "Please reload the extension in chrome://extensions to activate the new GET_DOM_STATE action."
-            )
+        finally:
+            server.stop()
 
 
 if __name__ == "__main__":

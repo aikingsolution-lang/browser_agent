@@ -28,6 +28,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from src.agent.browser_use.browser_use_agent import BrowserUseAgent
 from src.browser.extension_browser import ExtensionBrowser
 from src.browser.extension_context import ExtensionBrowserContext, ExtensionTabProxy
+from tests.local_fixture_server import LocalFixtureServer
 
 
 def get_sample_fixture() -> dict[str, Any]:
@@ -237,6 +238,9 @@ class TestExtensionAgentLive(unittest.IsolatedAsyncioTestCase):
                 "Skipping live agent test."
             )
 
+        server = LocalFixtureServer()
+        server_url = server.start()
+
         mock_llm = create_mock_llm()
         agent = BrowserUseAgent(
             task="Live Chrome reasoning step test",
@@ -246,12 +250,30 @@ class TestExtensionAgentLive(unittest.IsolatedAsyncioTestCase):
         )
 
         try:
-            # 1. Verify live state retrieval through agent's context
+            # 1. Bootstrap the agent-owned tab
+            initial_state = await agent.browser_context.get_state()
+            self.assertIsInstance(initial_state, BrowserState)
+            tab_id = agent.browser_context._current_tab_id
+            self.assertIsNotNone(tab_id)
+
+            # 2. Explicitly navigate that tab to fixture URL supplying tabId
+            nav_res = await agent.browser_context.execute_action("NAVIGATE", {"url": server_url, "tabId": tab_id})
+            self.assertTrue(nav_res.get("success", False))
+
+            # 3. Retrieve fresh BrowserState
+            agent.browser_context.invalidate_state()
             state = await agent.browser_context.get_state()
             self.assertIsInstance(state, BrowserState)
-            self.assertGreater(len(state.selector_map), 0)
+            self.assertIn(f"127.0.0.1:{server.port}", state.url)
 
-            # 2. Complete one reasoning step using mock action completion
+            # 4. Verify link, input, and button are represented in selector_map
+            tag_names = {node.tag_name.lower() for node in state.selector_map.values()}
+            self.assertIn("a", tag_names)
+            self.assertIn("input", tag_names)
+            self.assertIn("button", tag_names)
+            self.assertGreaterEqual(len(state.selector_map), 3)
+
+            # 5. Complete one reasoning step using mock action completion
             async def mock_get_next_action(input_messages):
                 return agent.AgentOutput(
                     current_state={
@@ -273,7 +295,13 @@ class TestExtensionAgentLive(unittest.IsolatedAsyncioTestCase):
                     "Live reasoning step verified",
                 )
         finally:
+            if agent.browser_context._current_tab_id is not None:
+                try:
+                    await agent.browser_context.execute_action("CLOSE_TAB", {"tabId": agent.browser_context._current_tab_id})
+                except Exception:
+                    pass
             await agent.close()
+            server.stop()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ from browser_use.browser.views import BrowserState, TabInfo
 from browser_use.dom.views import DOMElementNode
 
 from src.browser.extension_context import ExtensionBrowserContext, ExtensionTabProxy
+from tests.local_fixture_server import LocalFixtureServer
 
 
 def get_sample_fixture() -> dict[str, Any]:
@@ -327,8 +328,12 @@ class TestExtensionBrowserContextLive(unittest.IsolatedAsyncioTestCase):
                 "Skipping live integration test."
             )
 
-        async with ExtensionBrowserContext(server_url="http://127.0.0.1:8765") as context:
-            # 1. Fetch live DOM state
+        server = LocalFixtureServer()
+        server_url = server.start()
+
+        context = ExtensionBrowserContext(server_url="http://127.0.0.1:8765")
+        try:
+            # 1. Bootstrap the agent-owned tab
             try:
                 state = await context.get_state()
             except RuntimeError as err:
@@ -339,21 +344,47 @@ class TestExtensionBrowserContextLive(unittest.IsolatedAsyncioTestCase):
                 raise
 
             self.assertIsInstance(state, BrowserState)
-            self.assertIsInstance(state.element_tree, DOMElementNode)
-            self.assertGreater(len(state.selector_map), 0, "Expected clickable elements on active page")
+            tab_id = context._current_tab_id
+            self.assertIsNotNone(tab_id)
 
-            # 2. Query proxy page
+            # 2. Navigate that tab to the fixture URL
+            nav_res = await context.execute_action("NAVIGATE", {"url": server_url, "tabId": tab_id})
+            self.assertTrue(nav_res.get("success", False))
+
+            # 3. Retrieve a fresh BrowserState
+            context.invalidate_state()
+            state = await context.get_state()
+            self.assertIsInstance(state, BrowserState)
+            self.assertIsInstance(state.element_tree, DOMElementNode)
+
+            # 4. Verify the expected interactive elements
+            tag_names = {node.tag_name.lower() for node in state.selector_map.values()}
+            self.assertIn("a", tag_names)
+            self.assertIn("input", tag_names)
+            self.assertIn("button", tag_names)
+            self.assertGreaterEqual(len(state.selector_map), 3)
+
+            # 5. Verify ExtensionTabProxy exposes the correct URL and tab ID
             proxy_page = await context.get_current_page()
             self.assertIsInstance(proxy_page, ExtensionTabProxy)
-            self.assertGreater(proxy_page.tab_id, 0)
+            self.assertEqual(proxy_page.tab_id, tab_id)
             self.assertTrue(proxy_page.url.startswith("http"))
+            self.assertIn(f"127.0.0.1:{server.port}", proxy_page.url)
 
-            # 3. Query selector map
+            # 6. Query selector map directly
             selector_map = await context.get_selector_map()
-            self.assertGreater(len(selector_map), 0)
+            self.assertEqual(len(selector_map), len(state.selector_map))
 
-            # 4. Remove highlights
+            # 7. Remove highlights (no-op check)
             await context.remove_highlights()
+        finally:
+            if context._current_tab_id is not None:
+                try:
+                    await context.execute_action("CLOSE_TAB", {"tabId": context._current_tab_id})
+                except Exception:
+                    pass
+            await context.close()
+            server.stop()
 
 
 if __name__ == "__main__":
