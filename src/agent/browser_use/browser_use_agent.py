@@ -60,13 +60,6 @@ class BrowserUseAgent(Agent):
             **kwargs,
         )
 
-    async def close(self) -> None:
-        """Clean shutdown ensuring injected extension browser/context resources are closed."""
-        await super().close()
-        if isinstance(self.browser_context, ExtensionBrowserContext):
-            await self.browser_context.close()
-        if isinstance(self.browser, ExtensionBrowser):
-            await self.browser.close()
     def _set_tool_calling_method(self) -> ToolCallingMethod | None:
         tool_calling_method = self.settings.tool_calling_method
         if tool_calling_method == 'auto':

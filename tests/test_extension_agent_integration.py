@@ -195,7 +195,7 @@ class TestExtensionAgentIntegrationUnit(unittest.IsolatedAsyncioTestCase):
         await agent.close()
 
     async def test_agent_clean_shutdown(self):
-        """Verify agent shutdown closes underlying extension context resources idempotently."""
+        """Verify agent shutdown preserves injected extension context resources, and explicit context close is idempotent."""
         agent = BrowserUseAgent(
             task="Test clean shutdown",
             llm=self.mock_llm,
@@ -208,10 +208,14 @@ class TestExtensionAgentIntegrationUnit(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.is_closed)
 
         await agent.close()
-        self.assertIsNone(agent.browser_context._http_client)
+        # Injected context is preserved per upstream ownership semantics
+        self.assertFalse(agent.browser_context.is_closed)
+        self.assertIsNotNone(agent.browser_context._http_client)
 
-        # Double close should be idempotent
-        await agent.close()
+        # Explicit context close cleans up HTTP client resources idempotently
+        await agent.browser_context.close()
+        self.assertIsNone(agent.browser_context._http_client)
+        await agent.browser_context.close()
 
 
 class TestExtensionAgentLive(unittest.IsolatedAsyncioTestCase):
